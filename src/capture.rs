@@ -85,6 +85,7 @@ impl Capture {
             state: Default::default(),
             transition_epoch: transition_epoch(),
             next_transition_serial: 1,
+            ack_deadline: None,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -175,7 +176,15 @@ struct CaptureTask {
     state: State,
     transition_epoch: u64,
     next_transition_serial: u32,
+    /// when the pending `Enter` must have been acknowledged, otherwise the
+    /// capture is released so an unresponsive peer cannot freeze this desk
+    ack_deadline: Option<tokio::time::Instant>,
 }
+
+/// How long we hold the capture waiting for the peer to acknowledge an
+/// `Enter`. On a LAN an ack takes milliseconds; anything longer means the
+/// peer is asleep, offline or its emulation is stuck.
+const ACK_TIMEOUT: Duration = Duration::from_millis(1500);
 
 impl CaptureTask {
     fn add_capture(
@@ -332,6 +341,7 @@ impl CaptureTask {
                         ProtoEvent::Ack(serial) if self.state.acknowledges(serial) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            self.ack_deadline = None;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -340,6 +350,15 @@ impl CaptureTask {
                         },
                         _ => {}
                     }
+                },
+                // peer never acknowledged our Enter: give the desk back
+                _ = tokio::time::sleep_until(self.ack_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if self.ack_deadline.is_some() => {
+                    log::warn!(
+                        "releasing capture: client {:?} did not acknowledge within {ACK_TIMEOUT:?}",
+                        self.active_client
+                    );
+                    self.release_capture(capture).await?;
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
@@ -421,6 +440,7 @@ impl CaptureTask {
                     .then_some(serial)
                     .unwrap_or(0);
                 self.state = State::WaitingForAck { serial, event };
+                self.ack_deadline = Some(tokio::time::Instant::now() + ACK_TIMEOUT);
                 event
             }
             CaptureEvent::Input(e) => match self.state {
@@ -439,6 +459,7 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.ack_deadline = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the
