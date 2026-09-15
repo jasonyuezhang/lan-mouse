@@ -1,9 +1,9 @@
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{Emulation, EmulationHandle, WarpPosition, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -13,6 +13,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
+    screen::{Edge, EdgeSegments, Rect},
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -521,6 +522,65 @@ impl Emulation for MacOSEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    /// Place the cursor on `pos` edge at the normalized `cross_axis` offset
+    /// the peer reported, so it appears where it left the other screen.
+    async fn warp_cursor(
+        &mut self,
+        _handle: EmulationHandle,
+        pos: WarpPosition,
+        cross_axis: f32,
+    ) -> Result<(), EmulationError> {
+        if !cross_axis.is_finite() {
+            return Ok(());
+        }
+        let edge = match pos {
+            WarpPosition::Left => Edge::Left,
+            WarpPosition::Right => Edge::Right,
+            WarpPosition::Top => Edge::Top,
+            WarpPosition::Bottom => Edge::Bottom,
+        };
+        let Some((edge_coordinate, cross_coordinate)) =
+            EdgeSegments::from_rectangles(edge, display_rectangles()).denormalize(cross_axis)
+        else {
+            return Ok(());
+        };
+        let (x, y) = match edge {
+            Edge::Left | Edge::Right => (edge_coordinate, cross_coordinate),
+            Edge::Top | Edge::Bottom => (cross_coordinate, edge_coordinate),
+        };
+        let location = CGPoint::new(x as CGFloat, y as CGFloat);
+        // an absolute MouseMoved (like relative motion below) keeps the cursor
+        // and CG's tracking in sync; CGWarpMouseCursorPosition would not.
+        match CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::MouseMoved,
+            location,
+            CGMouseButton::Left,
+        ) {
+            Ok(event) => event.post(CGEventTapLocation::HID),
+            Err(_) => log::warn!("cursor warp: mouse event creation failed"),
+        }
+        log::debug!("warped cursor to {edge:?} edge @ ({x}, {y})");
+        Ok(())
+    }
+}
+
+/// Bounds of every active display in global (CGEvent) coordinates.
+fn display_rectangles() -> Vec<Rect> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Rect {
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as i32,
+                height: b.size.height.round() as i32,
+            }
+        })
+        .collect()
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {

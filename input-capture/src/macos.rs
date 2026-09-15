@@ -20,6 +20,7 @@ use core_graphics::{
 use futures_core::Stream;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    screen::{Edge, EdgeSegments, Rect},
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -99,6 +100,31 @@ impl InputCaptureState {
             }
         }
         None
+    }
+
+    /// Normalized position (0..=1) along the exposed desktop edge the cursor
+    /// is about to cross, so the peer can place the cursor at the same height / offset.
+    fn cross_axis(&self, event: &CGEvent, position: Position) -> Option<f32> {
+        let location = event.location();
+        let edge = match position {
+            Position::Left => Edge::Left,
+            Position::Right => Edge::Right,
+            Position::Top => Edge::Top,
+            Position::Bottom => Edge::Bottom,
+        };
+        let cross = match edge {
+            Edge::Left | Edge::Right => location.y,
+            Edge::Top | Edge::Bottom => location.x,
+        }
+        .round() as i32;
+        let segments = EdgeSegments::from_rectangles(edge, display_rectangles());
+        // the cursor may not sit exactly on the edge pixel yet; look the edge
+        // coordinate up from the segment covering our cross-axis position.
+        let edge_coordinate = segments
+            .segments()
+            .find(|s| cross >= s.cross_start && cross < s.cross_end)?
+            .edge_coordinate;
+        segments.normalize(edge_coordinate, cross)
     }
 
     // Get the max bounds of all displays
@@ -519,10 +545,11 @@ fn create_event_tap<'a>(
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
+                let cross_axis = state.cross_axis(cg_ev, new_pos);
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin { cross_axis: None });
+                res_events.push(CaptureEvent::Begin { cross_axis });
                 notify_tx
                     .blocking_send(ProducerEvent::Grab(new_pos))
                     .expect("Failed to send notification");
@@ -710,6 +737,23 @@ impl MacOSInputCapture {
             run_loop,
         })
     }
+}
+
+/// Bounds of every active display in global (CGEvent) coordinates.
+fn display_rectangles() -> Vec<Rect> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Rect {
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as i32,
+                height: b.size.height.round() as i32,
+            }
+        })
+        .collect()
 }
 
 fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> {
