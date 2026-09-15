@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
 };
@@ -33,6 +33,7 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            key_map: config_client.key_map,
         };
         let state = ClientState {
             active: config_client.active,
@@ -241,6 +242,15 @@ impl ClientManager {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.resolving = status;
         }
+    }
+
+    /// get the key remapping for the corresponding client
+    pub(crate) fn get_key_map(&self, handle: ClientHandle) -> HashMap<u32, u32> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.key_map.clone())
+            .unwrap_or_default()
     }
 
     /// get the enter hook command

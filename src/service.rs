@@ -229,6 +229,7 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                key_map: c.key_map,
             })
             .collect();
         self.config.set_clients(clients);
@@ -396,7 +397,8 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        self.capture
+            .create(handle, pos, CaptureType::EnterOnly, Default::default());
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -515,7 +517,9 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            let key_map = self.client_manager.get_key_map(handle);
+            self.capture
+                .create(handle, pos, CaptureType::Default, key_map);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }

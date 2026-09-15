@@ -80,6 +80,8 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// per-client key remapping, e.g. `key_map = { KeyLeftMeta = "KeyLeftCtrl" }`
+    key_map: Option<HashMap<scancode::Linux, scancode::Linux>>,
 }
 
 impl ConfigToml {
@@ -275,12 +277,20 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    /// evdev keycode -> evdev keycode, applied before sending to this client
+    pub key_map: HashMap<u32, u32>,
 }
 
 impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
+        let key_map = toml
+            .key_map
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(from, to)| (from as u32, to as u32))
+            .collect();
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
@@ -292,6 +302,7 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            key_map,
         }
     }
 }
@@ -299,6 +310,17 @@ impl From<TomlClient> for ConfigClient {
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
+        let key_map: HashMap<_, _> = client
+            .key_map
+            .into_iter()
+            .filter_map(|(from, to)| {
+                Some((
+                    scancode::Linux::try_from(from).ok()?,
+                    scancode::Linux::try_from(to).ok()?,
+                ))
+            })
+            .collect();
+        let key_map = (!key_map.is_empty()).then_some(key_map);
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
@@ -319,6 +341,7 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            key_map,
         }
     }
 }
@@ -576,5 +599,36 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scancode::Linux::*;
+
+    #[test]
+    fn key_map_round_trips_through_toml_with_readable_names() {
+        let toml_src = r#"
+[[clients]]
+hostname = "mbp"
+position = "left"
+key_map = { KeyLeftMeta = "KeyLeftCtrl", KeyLeftCtrl = "KeyLeftMeta", KeyCapsLock = "KeyEsc" }
+"#;
+        let parsed: ConfigToml = toml::from_str(toml_src).expect("parse");
+        let client: ConfigClient = parsed.clients.unwrap().remove(0).into();
+        assert_eq!(client.key_map[&(KeyLeftMeta as u32)], KeyLeftCtrl as u32);
+        assert_eq!(client.key_map[&(KeyCapsLock as u32)], KeyEsc as u32);
+        assert_eq!(client.key_map.len(), 3);
+
+        // and back: save-config must not lose it
+        let back: TomlClient = client.into();
+        let out = toml::to_string(&back).expect("serialize");
+        assert!(out.contains("KeyCapsLock = \"KeyEsc\""), "{out}");
+
+        // absent key_map stays absent (no noisy `key_map = {}` in saved config)
+        let plain: ConfigToml = toml::from_str("[[clients]]\nposition = \"right\"").unwrap();
+        let back: TomlClient = ConfigClient::from(plain.clients.unwrap().remove(0)).into();
+        assert!(back.key_map.is_none());
     }
 }

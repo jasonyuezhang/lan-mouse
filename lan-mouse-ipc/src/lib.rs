@@ -140,6 +140,9 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// key remapping (evdev keycode -> evdev keycode) applied to input sent to this client
+    #[serde(default)]
+    pub key_map: HashMap<u32, u32>,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +153,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            key_map: Default::default(),
         }
     }
 }

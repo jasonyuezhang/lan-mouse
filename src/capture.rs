@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -53,8 +54,8 @@ pub(crate) enum CaptureType {
 enum CaptureRequest {
     /// capture must release the mouse
     Release,
-    /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    /// add a capture client (with its key remapping)
+    Create(CaptureHandle, Position, CaptureType, KeyMap),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -113,10 +114,11 @@ impl Capture {
         handle: CaptureHandle,
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
+        key_map: KeyMap,
     ) {
         let pos = to_capture_pos(pos);
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, pos, capture_type, key_map))
             .expect("channel closed");
     }
 
@@ -158,11 +160,14 @@ macro_rules! debounce {
     };
 }
 
+/// evdev keycode -> evdev keycode
+pub(crate) type KeyMap = HashMap<u32, u32>;
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<(CaptureHandle, Position, CaptureType, KeyMap)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -173,8 +178,14 @@ struct CaptureTask {
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        pos: Position,
+        capture_type: CaptureType,
+        key_map: KeyMap,
+    ) {
+        self.captures.push((handle, pos, capture_type, key_map));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
@@ -184,7 +195,40 @@ impl CaptureTask {
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|(_, p, t, _)| *p == pos && *t == CaptureType::Default)
+    }
+
+    /// apply the client's key remapping to an outgoing input event
+    fn remap(&self, handle: CaptureHandle, event: Event) -> Event {
+        let Some((_, _, _, map)) = self.captures.iter().find(|(h, ..)| *h == handle) else {
+            return event;
+        };
+        if map.is_empty() {
+            return event;
+        }
+        match event {
+            Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
+                Event::Keyboard(KeyboardEvent::Key {
+                    time,
+                    key: *map.get(&key).unwrap_or(&key),
+                    state,
+                })
+            }
+            // macOS emulation derives CGEvent flags from this mask, so a
+            // remapped modifier key must move its bit too
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            }) => Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: remap_modifier_mask(depressed, map),
+                latched,
+                locked: remap_modifier_mask(locked, map),
+                group,
+            }),
+            other => other,
+        }
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
@@ -212,7 +256,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t, m) => self.add_capture(h, p, t, m),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
@@ -255,7 +299,7 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, ..) in captures {
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
@@ -300,8 +344,8 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
+                    CaptureRequest::Create(h, p, t, m) => {
+                        self.add_capture(h, p, t, m);
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
@@ -382,7 +426,7 @@ impl CaptureTask {
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck { event, .. } => event,
-                State::Sending => ProtoEvent::Input(e),
+                State::Sending => ProtoEvent::Input(self.remap(handle, e)),
             },
         };
 
@@ -408,11 +452,14 @@ impl CaptureTask {
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
             for key in capture.take_pressed_keys() {
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key: key as u32,
-                    state: 0,
-                }));
+                let key_up = ProtoEvent::Input(self.remap(
+                    handle,
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key: key as u32,
+                        state: 0,
+                    }),
+                ));
                 if let Err(e) = self.conn.send(key_up, handle).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
                 }
@@ -439,6 +486,39 @@ impl CaptureTask {
         }
         capture.release().await
     }
+}
+
+/// XKB-style modifier bit produced by a key, if it is a modifier
+/// (bit layout shared by the capture and emulation backends)
+fn modifier_bit(key: u32) -> Option<u32> {
+    use scancode::Linux::*;
+    Some(match scancode::Linux::try_from(key).ok()? {
+        KeyLeftShift | KeyRightShift => 1 << 0,
+        KeyCapsLock => 1 << 1,
+        KeyLeftCtrl | KeyRightCtrl => 1 << 2,
+        KeyLeftAlt | KeyRightalt => 1 << 3,
+        KeyLeftMeta | KeyRightmeta => 1 << 6,
+        _ => return None,
+    })
+}
+
+/// move modifier bits according to the key map, e.g. Ctrl->Meta moves
+/// the ControlMask bit to Mod4Mask
+// ponytail: left/right variants share a bit, so mapping only KeyLeftCtrl
+// also moves the bit when KeyRightCtrl is held; split masks if that matters
+fn remap_modifier_mask(mods: u32, map: &KeyMap) -> u32 {
+    let (mut clear, mut set) = (0, 0);
+    for (&from, &to) in map {
+        let Some(from_bit) = modifier_bit(from) else {
+            continue;
+        };
+        if mods & from_bit == 0 {
+            continue;
+        }
+        clear |= from_bit;
+        set |= modifier_bit(to).unwrap_or(0);
+    }
+    (mods & !clear) | set
 }
 
 thread_local! {
@@ -514,8 +594,30 @@ impl<T> Drop for DropGuard<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{KeyMap, State, remap_modifier_mask};
+    use input_event::scancode::Linux::*;
     use lan_mouse_proto::{Position, ProtoEvent};
+
+    #[test]
+    fn swapping_ctrl_and_meta_moves_modifier_bits() {
+        let map: KeyMap = [
+            (KeyLeftCtrl as u32, KeyLeftMeta as u32),
+            (KeyLeftMeta as u32, KeyLeftCtrl as u32),
+        ]
+        .into_iter()
+        .collect();
+        const CTRL: u32 = 1 << 2;
+        const META: u32 = 1 << 6;
+        const SHIFT: u32 = 1 << 0;
+        assert_eq!(remap_modifier_mask(CTRL, &map), META);
+        assert_eq!(remap_modifier_mask(META, &map), CTRL);
+        assert_eq!(remap_modifier_mask(CTRL | META, &map), CTRL | META);
+        assert_eq!(remap_modifier_mask(SHIFT | CTRL, &map), SHIFT | META);
+        // non-modifier mapping (CapsLock -> Esc) drops the lock bit
+        let caps: KeyMap = [(KeyCapsLock as u32, KeyEsc as u32)].into_iter().collect();
+        assert_eq!(remap_modifier_mask(1 << 1, &caps), 0);
+        assert_eq!(remap_modifier_mask(0, &map), 0);
+    }
 
     #[test]
     fn waiting_for_ack_only_accepts_the_pending_transition() {
