@@ -89,6 +89,7 @@ impl Capture {
             transition_epoch: transition_epoch(),
             next_transition_serial: 1,
             ack_deadline: None,
+            enter_backoff: HashMap::new(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -187,7 +188,16 @@ struct CaptureTask {
     /// when the pending `Enter` must have been acknowledged, otherwise the
     /// capture is released so an unresponsive peer cannot freeze this desk
     ack_deadline: Option<tokio::time::Instant>,
+    /// clients whose last `Enter` could not be sent, and until when we
+    /// leave the cursor alone at their edge instead of re-capturing
+    enter_backoff: HashMap<CaptureHandle, Instant>,
 }
+
+/// After an `Enter` fails to send (peer unreachable, emulation disabled),
+/// the cursor is still parked at the edge, so the very next motion event
+/// would capture again: a tight enter/leave loop firing the hooks on every
+/// iteration. Ignore that edge for a moment instead.
+const ENTER_BACKOFF: Duration = Duration::from_millis(1000);
 
 /// How long we hold the capture waiting for the peer to acknowledge an
 /// `Enter`. On a LAN an ack takes milliseconds; anything longer means the
@@ -452,6 +462,19 @@ impl CaptureTask {
             return Ok(());
         }
 
+        if matches!(event, CaptureEvent::Begin { .. }) {
+            match self.enter_backoff.get(&handle) {
+                Some(until) if Instant::now() < *until => {
+                    log::debug!("not entering client {handle}: last Enter failed a moment ago");
+                    capture.release().await?;
+                    return Ok(());
+                }
+                _ => {
+                    self.enter_backoff.remove(&handle);
+                }
+            }
+        }
+
         // activated a new client
         if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
             self.active_client.replace(handle);
@@ -493,6 +516,8 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            self.enter_backoff
+                .insert(handle, Instant::now() + ENTER_BACKOFF);
             // full release, not just the barrier: the cursor is back here, so
             // the leave hook must run. `active_client` is taken on the first
             // failure, later ones while the peer stays unreachable are cheap.

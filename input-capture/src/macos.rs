@@ -32,12 +32,18 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Mutex,
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
+
+/// A tap disabled by timeout this often within this window is not having a
+/// one-off stall; stop re-enabling it and tear down instead
+const TAP_TIMEOUTS_FATAL: usize = 3;
+const TAP_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
 
 /// Union of all displays. `xmin`/`ymin` is the first visible pixel,
 /// `xmax`/`ymax` is one past the last.
@@ -84,6 +90,9 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// recent `TapDisabledByTimeout` events, to tell a one-off stall from a
+    /// tap macOS keeps killing
+    tap_timeouts: Vec<Instant>,
 }
 
 #[derive(Debug)]
@@ -104,6 +113,7 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            tap_timeouts: Vec::new(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -495,14 +505,39 @@ fn create_event_tap<'a>(
 
         if matches!(event_type, CGEventType::TapDisabledByTimeout) {
             // The kernel disables the tap when our callback runs
-            // longer than ~1s on a single event — typical causes
-            // are heavy load, scheduler contention, or this
-            // process being briefly suspended (e.g. App Nap on a
-            // long idle). It is NOT a fatal condition: Apple's
-            // documented recovery is to call CGEventTapEnable
-            // and resume processing. Re-enable in place and KEEP
-            // existing capture state so the user doesn't see the
-            // cursor pop back to the local screen mid-session.
+            // longer than ~1s on a single event — heavy load, this
+            // process briefly suspended, or the daemon's thread
+            // stalled while the callback waited on it. Apple's
+            // documented recovery is to re-enable the tap.
+            //
+            // But never while capturing: in that state every local
+            // event is dropped and the cursor is pinned to the edge,
+            // so resurrecting the tap with capture state intact keeps
+            // the desk frozen for as long as the trouble lasts (a
+            // revoked Accessibility permission made macOS kill the
+            // tap 12 times in 90 s while the user could do nothing).
+            // Give the desk back first; the peer's watchdog releases
+            // our keys. And if the tap keeps dying, stop pretending
+            // it is a one-off: tear down so the service can report it.
+            let now = Instant::now();
+            state
+                .tap_timeouts
+                .retain(|t| now.duration_since(*t) < TAP_TIMEOUT_WINDOW);
+            state.tap_timeouts.push(now);
+            if state.current_pos.is_some() {
+                log::warn!("CGEventTap disabled by timeout while capturing — releasing capture");
+                let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                state.current_pos = None;
+                let _ = notify_tx.try_send(ProducerEvent::Release);
+            }
+            if state.tap_timeouts.len() >= TAP_TIMEOUTS_FATAL {
+                log::error!(
+                    "CGEventTap disabled by timeout {} times within {TAP_TIMEOUT_WINDOW:?} — giving up on it",
+                    state.tap_timeouts.len()
+                );
+                let _ = notify_tx.try_send(ProducerEvent::EventTapDisabled);
+                return CallbackResult::Keep;
+            }
             if let Some(&port) = tap_mach_port_cb.get() {
                 log::warn!("CGEventTap disabled by timeout — re-enabling");
                 unsafe {
@@ -535,7 +570,7 @@ fn create_event_tap<'a>(
                 state.current_pos = None;
             }
             notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
+                .try_send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to send notification: {e}");
                 });
@@ -574,17 +609,27 @@ fn create_event_tap<'a>(
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin { cross_axis });
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                // a closed channel (instance being dropped) must not
+                // panic-abort the daemon from inside the tap callback
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    log::error!("failed to notify producer of capture start: {e}");
+                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                    state.current_pos = None;
+                    return CallbackResult::Keep;
+                }
             }
         }
 
         if let Some(pos) = capture_position {
+            // This callback runs inside the OS input path: if it blocks,
+            // macOS stalls all input, then kills the tap. When the
+            // daemon's thread is not keeping up, losing an event is far
+            // better than freezing the desk — so never block here.
             res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                if let Err(err) = event_tx.try_send((pos, *e)) {
+                    // closed when the instance is dropped, full when stalled
+                    log::debug!("dropping captured event: {err}");
+                }
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
