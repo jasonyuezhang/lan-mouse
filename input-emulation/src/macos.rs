@@ -19,6 +19,7 @@ use input_event::{
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::ffi::{CStr, c_char, c_void};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,8 +27,10 @@ use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
-const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
-const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+/// Key repeat used when AppKit cannot tell us the user's setting
+/// (System Settings → Keyboard defaults are 0.25 s / 0.033 s on current macOS)
+const FALLBACK_REPEAT_DELAY: Duration = Duration::from_millis(250);
+const FALLBACK_REPEAT_INTERVAL: Duration = Duration::from_millis(33);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) struct MacOSEmulation {
@@ -47,6 +50,9 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// the user's key repeat settings on this machine
+    repeat_delay: Duration,
+    repeat_interval: Duration,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -68,6 +74,8 @@ impl MacOSEmulation {
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         permit_local_input_while_emulating(&event_source);
+        let (repeat_delay, repeat_interval) = system_key_repeat();
+        log::debug!("key repeat: delay {repeat_delay:?}, interval {repeat_interval:?}");
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -77,6 +85,8 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            repeat_delay,
+            repeat_interval,
         })
     }
 
@@ -95,16 +105,17 @@ impl MacOSEmulation {
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
+        let (delay, interval) = (self.repeat_delay, self.repeat_interval);
         let repeat_task = tokio::task::spawn_local(async move {
             let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
+                _ = tokio::time::sleep(delay) => false,
                 _ = notify.notified() => true,
             };
             if !stop {
                 loop {
                     key_event(event_source.clone(), key, 1, modifiers.get());
                     tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
+                        _ = tokio::time::sleep(interval) => {},
                         _ = notify.notified() => break,
                     }
                 }
@@ -183,6 +194,38 @@ fn permit_local_input_while_emulating(source: &CGEventSource) {
     }
 }
 
+/// The user's key repeat delay and interval (System Settings → Keyboard),
+/// as AppKit reports them. Read once at startup; the `defaults` values are
+/// in 1/60 s ticks and AppKit already applies the system defaults, so ask it
+/// rather than re-deriving the numbers.
+fn system_key_repeat() -> (Duration, Duration) {
+    let delay = ns_event_interval(c"keyRepeatDelay");
+    let interval = ns_event_interval(c"keyRepeatInterval");
+    (
+        delay.unwrap_or(FALLBACK_REPEAT_DELAY),
+        interval.unwrap_or(FALLBACK_REPEAT_INTERVAL),
+    )
+}
+
+/// `+[NSEvent <selector>]` returning an NSTimeInterval, `None` if unusable
+fn ns_event_interval(selector: &CStr) -> Option<Duration> {
+    // SAFETY: plain class-method call on a class that exists in every AppKit;
+    // `objc_msgSend` is cast to the signature of a method returning a double,
+    // which is the standard way to call it without the objc runtime crates
+    let seconds = unsafe {
+        let class = objc_getClass(c"NSEvent".as_ptr());
+        if class.is_null() {
+            return None;
+        }
+        let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        send(class, sel_registerName(selector.as_ptr()))
+    };
+    // 0.0 is what a broken read looks like; a real "off" is a huge number
+    (seconds.is_finite() && seconds > 0.0 && seconds < 10.0)
+        .then(|| Duration::from_secs_f64(seconds))
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
@@ -196,6 +239,17 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+}
+
+// AppKit only for `+[NSEvent keyRepeatDelay]` / `keyRepeatInterval`
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {}
+
+#[link(name = "objc")]
+extern "C" {
+    fn objc_getClass(name: *const c_char) -> *mut c_void;
+    fn sel_registerName(name: *const c_char) -> *mut c_void;
+    fn objc_msgSend();
 }
 
 /// Mac virtual key codes for the four arrow keys.
