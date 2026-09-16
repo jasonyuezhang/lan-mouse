@@ -76,6 +76,28 @@ struct Incoming {
     pos: Position,
 }
 
+/// Resolves on Ctrl+C, and on unix also on SIGTERM — what launchd / systemd
+/// send on stop or restart. Without it the daemon just died: no `Leave` to
+/// the peer (it kept our keys held until its watchdog) and no leave hook.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                r = signal::ctrl_c() => r.expect("failed to wait for CTRL+C"),
+                _ = term.recv() => log::info!("received SIGTERM"),
+            },
+            Err(e) => {
+                log::warn!("failed to install SIGTERM handler: {e}");
+                signal::ctrl_c().await.expect("failed to wait for CTRL+C");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    signal::ctrl_c().await.expect("failed to wait for CTRL+C");
+}
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
@@ -140,6 +162,8 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -148,13 +172,18 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                _ = &mut shutdown => break,
             }
         }
 
         log::info!("terminating service ...");
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
+        // the capture releases a still-active client on the way out; handle
+        // what it emitted (ClientLeft => leave hook) now that the loop is gone
+        while let Some(event) = self.capture.try_event() {
+            self.handle_capture_event(event);
+        }
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");

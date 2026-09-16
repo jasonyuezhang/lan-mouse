@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
@@ -140,6 +140,11 @@ impl Capture {
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
         self.event_rx.recv().await.expect("channel closed")
+    }
+
+    /// an already queued event, if any (used to drain after [`Self::terminate`])
+    pub(crate) fn try_event(&mut self) -> Option<ICaptureEvent> {
+        self.event_rx.recv().now_or_never().flatten()
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
@@ -312,6 +317,16 @@ impl CaptureTask {
 
         let r = self.do_capture_session(&mut capture).await;
 
+        // Whether we are shutting down or the backend failed, the cursor is
+        // back on this device once the capture is gone: tell the peer (so it
+        // releases held keys now instead of on its watchdog) and let the
+        // service run the leave hook.
+        if self.active_client.is_some() {
+            if let Err(e) = self.release_capture(&mut capture).await {
+                log::warn!("failed to release capture: {e}");
+            }
+        }
+
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;
 
@@ -380,6 +395,10 @@ impl CaptureTask {
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
+                        // deactivated while the cursor was on it
+                        if self.active_client == Some(h) {
+                            self.release_capture(capture).await?;
+                        }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
@@ -465,7 +484,10 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
+            // full release, not just the barrier: the cursor is back here, so
+            // the leave hook must run. `active_client` is taken on the first
+            // failure, later ones while the peer stays unreachable are cheap.
+            self.release_capture(capture).await?;
         }
         Ok(())
     }
