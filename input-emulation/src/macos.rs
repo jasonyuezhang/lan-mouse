@@ -10,6 +10,7 @@ use core_graphics::event::{
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use foreign_types::ForeignType;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
@@ -66,6 +67,7 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        permit_local_input_while_emulating(&event_source);
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
@@ -159,9 +161,36 @@ fn request_input_control_permission() -> bool {
     unsafe { CGPreflightPostEventAccess() }
 }
 
+/// After a synthetic event is posted, macOS suppresses the *local* mouse and
+/// keyboard for 0.25 s by default (measured: interval 0.25 s, filter mask 0).
+/// While a peer drives this machine every packet re-arms that lockout, so
+/// grabbing the local mouse or typing here loses the first quarter second.
+/// Let local input through, in both suppression states (post-event interval
+/// and synthetic drag) — a KVM user must always be able to take over.
+fn permit_local_input_while_emulating(source: &CGEventSource) {
+    // CGRemoteOperation.h
+    const PERMIT_ALL_EVENTS: u32 = 0x7; // kCGEventFilterMaskPermitAllEvents
+    const SUPPRESSION_INTERVAL: u32 = 0; // kCGEventSuppressionStateSuppressionInterval
+    const REMOTE_MOUSE_DRAG: u32 = 1; // kCGEventSuppressionStateRemoteMouseDrag
+    for state in [SUPPRESSION_INTERVAL, REMOTE_MOUSE_DRAG] {
+        unsafe {
+            CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+                source.as_ptr(),
+                PERMIT_ALL_EVENTS,
+                state,
+            );
+        }
+    }
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+        source: core_graphics::sys::CGEventSourceRef,
+        filter: u32,
+        state: u32,
+    );
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
