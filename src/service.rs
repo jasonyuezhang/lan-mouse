@@ -229,6 +229,7 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                leave_hook: c.leave_cmd,
                 key_map: c.key_map,
             })
             .collect();
@@ -350,7 +351,11 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle);
+                self.spawn_hook_command(self.client_manager.get_enter_cmd(handle));
+            }
+            ICaptureEvent::ClientLeft(handle) => {
+                log::info!("left client {handle}");
+                self.spawn_hook_command(self.client_manager.get_leave_cmd(handle));
             }
         }
     }
@@ -586,12 +591,12 @@ impl Service {
         self.notify_frontend(event);
     }
 
-    fn spawn_hook_command(&self, handle: ClientHandle) {
-        let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
+    fn spawn_hook_command(&self, cmd: Option<String>) {
+        let Some(cmd) = cmd else {
             return;
         };
         tokio::task::spawn_local(async move {
-            log::info!("spawning command!");
+            log::info!("spawning hook: {cmd}");
             let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
                 Ok(c) => c,
                 Err(e) => {

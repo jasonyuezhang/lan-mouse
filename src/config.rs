@@ -83,6 +83,8 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// shell command run when the cursor comes back from this client
+    leave_hook: Option<String>,
     /// per-client key remapping, e.g. `key_map = { KeyLeftMeta = "KeyLeftCtrl" }`
     key_map: Option<HashMap<scancode::Linux, scancode::Linux>>,
     /// per-client mouse button remapping, e.g. `button_map = { Middle = "Back" }`
@@ -315,6 +317,7 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    pub leave_hook: Option<String>,
     /// evdev keycode -> evdev keycode, applied before sending to this client
     pub key_map: HashMap<u32, u32>,
 }
@@ -323,6 +326,7 @@ impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
+        let leave_hook = toml.leave_hook;
         // keys and buttons share the evdev code space, so one map covers both
         let key_map = toml
             .key_map
@@ -347,6 +351,7 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            leave_hook,
             key_map,
         }
     }
@@ -387,6 +392,7 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
+        let leave_hook = client.leave_hook;
         Self {
             hostname,
             host_name,
@@ -395,6 +401,7 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            leave_hook,
             key_map,
             button_map,
         }

@@ -140,6 +140,9 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// leave hook: shell command run when the cursor returns from this client
+    #[serde(default)]
+    pub leave_cmd: Option<String>,
     /// key remapping (evdev keycode -> evdev keycode) applied to input sent to this client
     #[serde(default)]
     pub key_map: HashMap<u32, u32>,
@@ -153,6 +156,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            leave_cmd: None,
             key_map: Default::default(),
         }
     }

@@ -33,6 +33,7 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            leave_cmd: config_client.leave_hook,
             key_map: config_client.key_map,
         };
         let state = ClientState {
@@ -259,6 +260,14 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .and_then(|(c, _)| c.cmd.clone())
+    }
+
+    /// get the leave hook command
+    pub(crate) fn get_leave_cmd(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(c, _)| c.leave_cmd.clone())
     }
 
     /// returns all clients that are currently registered
