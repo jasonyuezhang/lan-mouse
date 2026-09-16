@@ -39,12 +39,37 @@ use tokio::sync::{
     oneshot,
 };
 
+/// Union of all displays. `xmin`/`ymin` is the first visible pixel,
+/// `xmax`/`ymax` is one past the last.
 #[derive(Debug, Default)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+impl Bounds {
+    /// Does a pointer at `location` moving by `delta` leave the desktop on
+    /// `position`'s side?
+    ///
+    /// Strict on all four sides: the pointer has to be pushed *past* the outer
+    /// pixel, sitting on it is not enough. The event tap also sees the events
+    /// our own emulation posts, and a peer's positioned `Enter` warps the
+    /// cursor exactly onto `xmin`/`ymin` with a zero delta. With `<=` that
+    /// warp tripped our own barrier, which told the peer to release, whose
+    /// warp tripped its barrier, ... — a visible enter/leave ping-pong at the
+    /// edge (and a hook storm) every time the cursor came back from a client
+    /// under the peer's own mouse.
+    fn crosses(&self, position: Position, location: (f64, f64), delta: (f64, f64)) -> bool {
+        let (x, y) = (location.0 + delta.0, location.1 + delta.1);
+        match position {
+            Position::Left => x < self.xmin,
+            Position::Right => x >= self.xmax,
+            Position::Top => y < self.ymin,
+            Position::Bottom => y >= self.ymax,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -90,10 +115,9 @@ impl InputCaptureState {
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
 
         for &position in self.active_clients.iter() {
-            if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
-                || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
-                || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
-                || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
+            if self
+                .bounds
+                .crosses(position, (location.x, location.y), (relative_x, relative_y))
             {
                 log::debug!("Crossed barrier into position: {position:?}");
                 return Some(position);
@@ -928,5 +952,59 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bounds, Position};
+
+    // 1920x1080 main display with a 1440x900 one to its right; x: 0..3360
+    fn desktop() -> Bounds {
+        Bounds {
+            xmin: 0.0,
+            xmax: 3360.0,
+            ymin: 0.0,
+            ymax: 1080.0,
+        }
+    }
+
+    #[test]
+    fn a_peer_warping_us_onto_the_edge_pixel_is_not_a_crossing() {
+        let b = desktop();
+        // emulation.warp_cursor(): absolute MouseMoved onto the edge, no delta
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (0.0, 0.0)));
+        assert!(!b.crosses(Position::Top, (800.0, 0.0), (0.0, 0.0)));
+        // and neither is the peer then moving us inwards or along the edge
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (3.0, 0.0)));
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (0.0, -7.0)));
+    }
+
+    #[test]
+    fn pushing_past_the_edge_pixel_crosses() {
+        let b = desktop();
+        // macOS pins the location on the outer pixel; the delta keeps going
+        assert!(b.crosses(Position::Left, (0.0, 500.0), (-1.0, 0.0)));
+        assert!(b.crosses(Position::Top, (800.0, 0.0), (0.0, -1.0)));
+        assert!(b.crosses(Position::Right, (3359.0, 500.0), (1.0, 0.0)));
+        assert!(b.crosses(Position::Bottom, (800.0, 1079.0), (0.0, 1.0)));
+    }
+
+    #[test]
+    fn near_and_far_edges_behave_the_same() {
+        let b = desktop();
+        // sitting on the outer pixel with no delta: no crossing on any side
+        assert!(!b.crosses(Position::Right, (3359.0, 500.0), (0.0, 0.0)));
+        assert!(!b.crosses(Position::Bottom, (800.0, 1079.0), (0.0, 0.0)));
+        // well inside, large movement that stays inside
+        assert!(!b.crosses(Position::Left, (100.0, 500.0), (-99.0, 0.0)));
+        assert!(!b.crosses(Position::Right, (3000.0, 500.0), (359.0, 0.0)));
+    }
+
+    #[test]
+    fn only_the_configured_side_counts() {
+        let b = desktop();
+        assert!(!b.crosses(Position::Right, (0.0, 500.0), (-5.0, 0.0)));
+        assert!(!b.crosses(Position::Left, (3359.0, 500.0), (5.0, 0.0)));
     }
 }
