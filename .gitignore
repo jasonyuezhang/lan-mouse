@@ -1,5 +1,6 @@
 /target
 .gdbinit
+.DS_Store
 .idea/
 .vs/
 .vscode/
