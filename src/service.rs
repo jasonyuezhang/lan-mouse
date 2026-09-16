@@ -6,6 +6,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    hooks::{HookState, Hooks},
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
@@ -21,7 +22,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{signal, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -44,6 +45,8 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// enter / leave hook runner
+    hooks: Hooks,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -134,6 +137,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            hooks: Hooks::new(),
             authorized_keys,
             public_key_fingerprint,
             client_manager,
@@ -188,6 +192,8 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating hooks ...");
+        self.hooks.terminate().await;
 
         Ok(())
     }
@@ -380,11 +386,13 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(self.client_manager.get_enter_cmd(handle));
+                let cmd = self.client_manager.get_enter_cmd(handle);
+                self.hooks.run(handle, HookState::Entered, cmd);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("left client {handle}");
-                self.spawn_hook_command(self.client_manager.get_leave_cmd(handle));
+                let cmd = self.client_manager.get_leave_cmd(handle);
+                self.hooks.run(handle, HookState::Left, cmd);
             }
         }
     }
@@ -618,31 +626,5 @@ impl Service {
             .map(|(c, s)| FrontendEvent::State(handle, c, s))
             .unwrap_or(FrontendEvent::NoSuchClient(handle));
         self.notify_frontend(event);
-    }
-
-    fn spawn_hook_command(&self, cmd: Option<String>) {
-        let Some(cmd) = cmd else {
-            return;
-        };
-        tokio::task::spawn_local(async move {
-            log::info!("spawning hook: {cmd}");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute cmd: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{cmd} exited successfully");
-                    } else {
-                        log::warn!("{cmd} exited with {s}");
-                    }
-                }
-                Err(e) => log::warn!("{cmd}: {e}"),
-            }
-        });
     }
 }
