@@ -308,6 +308,9 @@ async fn receive_loop(
                         client_manager.set_active_addr(handle, Some(addr));
                         client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);
+                        // the capture task wants to know when the peer it is
+                        // sending to stops being a live target (see there)
+                        tx.send((handle, event)).expect("channel closed");
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));

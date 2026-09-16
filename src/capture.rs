@@ -375,6 +375,15 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // Safety net: while we forward input, every local event
+                        // is swallowed and this desk is frozen. If the peer
+                        // reports its emulation is gone, nothing we send does
+                        // anything anymore, so give the desk back right away
+                        // instead of waiting for the next local event to fail.
+                        ProtoEvent::Pong(false) if self.active_client.is_some() => {
+                            log::warn!("releasing capture: client {handle} has no input emulation");
+                            self.release_capture(capture).await?;
+                        },
                         _ => {}
                     }
                 },

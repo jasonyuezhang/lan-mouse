@@ -117,6 +117,13 @@ impl InputEmulation {
             return b;
         }
 
+        // No dummy fallback here (matching input-capture): the dummy only
+        // logs events, but a daemon running it still answers pings and
+        // acknowledges Enter, so peers hand over their input to a black hole
+        // and are frozen until they find the release bind. Missing
+        // permissions must surface as "emulation disabled", which peers
+        // check before sending. The dummy stays available explicitly via
+        // `emulation_backend = "dummy"`.
         for backend in [
             #[cfg(wlroots)]
             Backend::Wlroots,
@@ -130,7 +137,6 @@ impl InputEmulation {
             Backend::Windows,
             #[cfg(target_os = "macos")]
             Backend::MacOs,
-            Backend::Dummy,
         ] {
             match Self::with_backend(backend).await {
                 Ok(b) => {

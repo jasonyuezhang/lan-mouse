@@ -55,7 +55,9 @@ pub enum EmulationCreationError {
     #[cfg(windows)]
     #[error("windows: `{0}`")]
     Windows(#[from] WindowsEmulationCreationError),
-    #[error("capture error")]
+    #[error(
+        "no emulation backend available (missing permissions?) - this device will refuse incoming input until one is; run `lan-mouse enable-emulation` to retry"
+    )]
     NoAvailableBackend,
 }
 
