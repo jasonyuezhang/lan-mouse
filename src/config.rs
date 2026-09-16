@@ -19,9 +19,12 @@ use toml_edit::{self, DocumentMut};
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{DEFAULT_PORT, Position};
 
-use input_event::scancode::{
-    self,
-    Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
+use input_event::{
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
+    scancode::{
+        self,
+        Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
+    },
 };
 
 use shadow_rs::shadow;
@@ -82,6 +85,41 @@ struct TomlClient {
     enter_hook: Option<String>,
     /// per-client key remapping, e.g. `key_map = { KeyLeftMeta = "KeyLeftCtrl" }`
     key_map: Option<HashMap<scancode::Linux, scancode::Linux>>,
+    /// per-client mouse button remapping, e.g. `button_map = { Middle = "Back" }`
+    button_map: Option<HashMap<MouseButton, MouseButton>>,
+}
+
+/// Mouse button names accepted in `button_map`
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq, Hash)]
+enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+impl MouseButton {
+    fn code(self) -> u32 {
+        match self {
+            Self::Left => BTN_LEFT,
+            Self::Right => BTN_RIGHT,
+            Self::Middle => BTN_MIDDLE,
+            Self::Back => BTN_BACK,
+            Self::Forward => BTN_FORWARD,
+        }
+    }
+
+    fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            BTN_LEFT => Self::Left,
+            BTN_RIGHT => Self::Right,
+            BTN_MIDDLE => Self::Middle,
+            BTN_BACK => Self::Back,
+            BTN_FORWARD => Self::Forward,
+            _ => return None,
+        })
+    }
 }
 
 impl ConfigToml {
@@ -285,11 +323,18 @@ impl From<TomlClient> for ConfigClient {
     fn from(toml: TomlClient) -> Self {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
+        // keys and buttons share the evdev code space, so one map covers both
         let key_map = toml
             .key_map
             .unwrap_or_default()
             .into_iter()
             .map(|(from, to)| (from as u32, to as u32))
+            .chain(
+                toml.button_map
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(from, to)| (from.code(), to.code())),
+            )
             .collect();
         let hostname = toml.hostname;
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
@@ -310,9 +355,17 @@ impl From<TomlClient> for ConfigClient {
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
+        let button_map: HashMap<_, _> = client
+            .key_map
+            .iter()
+            .filter_map(|(&from, &to)| {
+                Some((MouseButton::from_code(from)?, MouseButton::from_code(to)?))
+            })
+            .collect();
         let key_map: HashMap<_, _> = client
             .key_map
             .into_iter()
+            .filter(|(from, _)| MouseButton::from_code(*from).is_none())
             .filter_map(|(from, to)| {
                 Some((
                     scancode::Linux::try_from(from).ok()?,
@@ -321,6 +374,7 @@ impl From<ConfigClient> for TomlClient {
             })
             .collect();
         let key_map = (!key_map.is_empty()).then_some(key_map);
+        let button_map = (!button_map.is_empty()).then_some(button_map);
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
@@ -342,6 +396,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             key_map,
+            button_map,
         }
     }
 }
@@ -614,21 +669,28 @@ mod tests {
 hostname = "mbp"
 position = "left"
 key_map = { KeyLeftMeta = "KeyLeftCtrl", KeyLeftCtrl = "KeyLeftMeta", KeyCapsLock = "KeyEsc" }
+button_map = { Middle = "Back", Left = "Right" }
 "#;
         let parsed: ConfigToml = toml::from_str(toml_src).expect("parse");
         let client: ConfigClient = parsed.clients.unwrap().remove(0).into();
         assert_eq!(client.key_map[&(KeyLeftMeta as u32)], KeyLeftCtrl as u32);
         assert_eq!(client.key_map[&(KeyCapsLock as u32)], KeyEsc as u32);
-        assert_eq!(client.key_map.len(), 3);
+        assert_eq!(client.key_map[&BTN_MIDDLE], BTN_BACK);
+        assert_eq!(client.key_map[&BTN_LEFT], BTN_RIGHT);
+        assert_eq!(client.key_map.len(), 5);
 
-        // and back: save-config must not lose it
+        // and back: save-config must not lose it, and buttons go back to button_map
         let back: TomlClient = client.into();
         let out = toml::to_string(&back).expect("serialize");
         assert!(out.contains("KeyCapsLock = \"KeyEsc\""), "{out}");
+        assert!(out.contains("Middle = \"Back\""), "{out}");
+        assert_eq!(back.key_map.as_ref().unwrap().len(), 3);
+        assert_eq!(back.button_map.as_ref().unwrap().len(), 2);
 
         // absent key_map stays absent (no noisy `key_map = {}` in saved config)
         let plain: ConfigToml = toml::from_str("[[clients]]\nposition = \"right\"").unwrap();
         let back: TomlClient = ConfigClient::from(plain.clients.unwrap().remove(0)).into();
         assert!(back.key_map.is_none());
+        assert!(back.button_map.is_none());
     }
 }

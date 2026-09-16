@@ -9,7 +9,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -223,6 +223,15 @@ impl CaptureTask {
                     state,
                 })
             }
+            Event::Pointer(PointerEvent::Button {
+                time,
+                button,
+                state,
+            }) => Event::Pointer(PointerEvent::Button {
+                time,
+                button: *map.get(&button).unwrap_or(&button),
+                state,
+            }),
             // macOS emulation derives CGEvent flags from this mask, so a
             // remapped modifier key must move its bit too
             Event::Keyboard(KeyboardEvent::Modifiers {
