@@ -1,14 +1,15 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -37,13 +38,10 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
-    /// The previously active client was left, i.e. capture
-    /// was released for the given handle. Mirrors
-    /// [`ICaptureEvent::ClientEntered`] for the leave side
-    /// and fires on every release path (release-bind chord,
-    /// remote `Leave`, explicit `Release` request, send
-    /// failure, or destroy of the active capture).
+    /// The capture was released while this client was active:
+    /// the cursor is back on this device.
     ClientLeft(u64),
+    SharingShortcutPressed(lan_mouse_ipc::SharingShortcut),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,14 +58,17 @@ pub(crate) enum CaptureType {
 enum CaptureRequest {
     /// capture must release the mouse
     Release,
-    /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    /// add a capture client (with its key remapping)
+    Create(CaptureHandle, Position, CaptureType, KeyMap),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    SetSharingShortcut(Option<lan_mouse_ipc::SharingShortcut>),
+    StartFileDrag(CaptureHandle, Option<i32>),
+    PrepareFileDrag(CaptureHandle),
 }
 
 impl Capture {
@@ -80,6 +81,9 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
+            file_drag_button: false,
+            file_drag_released: false,
+            sharing_shortcut: None,
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -89,6 +93,10 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            transition_epoch: transition_epoch(),
+            next_transition_serial: 1,
+            ack_deadline: None,
+            enter_backoff: HashMap::new(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -118,10 +126,11 @@ impl Capture {
         handle: CaptureHandle,
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
+        key_map: KeyMap,
     ) {
         let pos = to_capture_pos(pos);
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, pos, capture_type, key_map))
             .expect("channel closed");
     }
 
@@ -139,6 +148,29 @@ impl Capture {
 
     pub(crate) async fn event(&mut self) -> ICaptureEvent {
         self.event_rx.recv().await.expect("channel closed")
+    }
+
+    /// an already queued event, if any (used to drain after [`Self::terminate`])
+    pub(crate) fn try_event(&mut self) -> Option<ICaptureEvent> {
+        self.event_rx.recv().now_or_never().flatten()
+    }
+
+    pub(crate) fn prepare_file_drag(&self, handle: CaptureHandle) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::PrepareFileDrag(handle));
+    }
+
+    pub(crate) fn start_file_drag(&self, handle: CaptureHandle, source_pid: Option<i32>) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::StartFileDrag(handle, source_pid));
+    }
+
+    pub(crate) fn set_sharing_shortcut(&self, shortcut: Option<lan_mouse_ipc::SharingShortcut>) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetSharingShortcut(shortcut));
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
@@ -163,21 +195,52 @@ macro_rules! debounce {
     };
 }
 
+/// evdev keycode -> evdev keycode
+pub(crate) type KeyMap = HashMap<u32, u32>;
+
 struct CaptureTask {
+    file_drag_button: bool,
+    file_drag_released: bool,
+    sharing_shortcut: Option<crate::sharing_shortcut::CaptureShortcut>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<(CaptureHandle, Position, CaptureType, KeyMap)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    transition_epoch: u64,
+    next_transition_serial: u32,
+    /// when the pending `Enter` must have been acknowledged, otherwise the
+    /// capture is released so an unresponsive peer cannot freeze this desk
+    ack_deadline: Option<tokio::time::Instant>,
+    /// clients whose last `Enter` could not be sent, and until when we
+    /// leave the cursor alone at their edge instead of re-capturing
+    enter_backoff: HashMap<CaptureHandle, Instant>,
 }
 
+/// After an `Enter` fails to send (peer unreachable, emulation disabled),
+/// the cursor is still parked at the edge, so the very next motion event
+/// would capture again: a tight enter/leave loop firing the hooks on every
+/// iteration. Ignore that edge for a moment instead.
+const ENTER_BACKOFF: Duration = Duration::from_millis(1000);
+
+/// How long we hold the capture waiting for the peer to acknowledge an
+/// `Enter`. On a LAN an ack takes milliseconds; anything longer means the
+/// peer is asleep, offline or its emulation is stuck.
+const ACK_TIMEOUT: Duration = Duration::from_millis(1500);
+
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(
+        &mut self,
+        handle: CaptureHandle,
+        pos: Position,
+        capture_type: CaptureType,
+        key_map: KeyMap,
+    ) {
+        self.captures.push((handle, pos, capture_type, key_map));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
@@ -187,7 +250,49 @@ impl CaptureTask {
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|(_, p, t, _)| *p == pos && *t == CaptureType::Default)
+    }
+
+    /// apply the client's key remapping to an outgoing input event
+    fn remap(&self, handle: CaptureHandle, event: Event) -> Event {
+        let Some((_, _, _, map)) = self.captures.iter().find(|(h, ..)| *h == handle) else {
+            return event;
+        };
+        if map.is_empty() {
+            return event;
+        }
+        match event {
+            Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
+                Event::Keyboard(KeyboardEvent::Key {
+                    time,
+                    key: *map.get(&key).unwrap_or(&key),
+                    state,
+                })
+            }
+            Event::Pointer(PointerEvent::Button {
+                time,
+                button,
+                state,
+            }) => Event::Pointer(PointerEvent::Button {
+                time,
+                button: *map.get(&button).unwrap_or(&button),
+                state,
+            }),
+            // macOS emulation derives CGEvent flags from this mask, so a
+            // remapped modifier key must move its bit too
+            Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            }) => Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: remap_modifier_mask(depressed, map),
+                latched,
+                locked: remap_modifier_mask(locked, map),
+                group,
+            }),
+            other => other,
+        }
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
@@ -214,11 +319,16 @@ impl CaptureTask {
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
+                        CaptureRequest::PrepareFileDrag(handle) => { let _ = self.conn.send(ProtoEvent::Ping, handle).await; },
+                        CaptureRequest::StartFileDrag(_, _) => {},
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t, m) => self.add_capture(h, p, t, m),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
+                        CaptureRequest::SetSharingShortcut(shortcut) => {
+                        self.sharing_shortcut = shortcut.and_then(crate::sharing_shortcut::CaptureShortcut::new);
+                    }
+                    CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                     },
@@ -250,6 +360,16 @@ impl CaptureTask {
 
         let r = self.do_capture_session(&mut capture).await;
 
+        // Whether we are shutting down or the backend failed, the cursor is
+        // back on this device once the capture is gone: tell the peer (so it
+        // releases held keys now instead of on its watchdog) and let the
+        // service run the leave hook.
+        if self.active_client.is_some() {
+            if let Err(e) = self.release_capture(&mut capture).await {
+                log::warn!("failed to release capture: {e}");
+            }
+        }
+
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;
 
@@ -258,7 +378,7 @@ impl CaptureTask {
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, ..) in captures {
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
@@ -288,38 +408,67 @@ impl CaptureTask {
 
                     match event {
                         // connection acknowlegded => set state to Sending
-                        ProtoEvent::Ack(_) => {
+                        ProtoEvent::Ack(serial) if self.state.acknowledges(serial) => {
                             log::info!("client {handle} acknowledged the connection!");
+                            let was_waiting = !matches!(self.state, State::Sending);
                             self.state = State::Sending;
+                            if was_waiting && self.file_drag_button { self.send_file_drag_button(handle, 1).await; }
+                            self.ack_deadline = None;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // Safety net: while we forward input, every local event
+                        // is swallowed and this desk is frozen. If the peer
+                        // reports its emulation is gone, nothing we send does
+                        // anything anymore, so give the desk back right away
+                        // instead of waiting for the next local event to fail.
+                        ProtoEvent::Pong(false) if self.active_client.is_some() => {
+                            log::warn!("releasing capture: client {handle} has no input emulation");
+                            self.release_capture(capture).await?;
+                        },
                         _ => {}
                     }
                 },
+                // peer never acknowledged our Enter: give the desk back
+                _ = tokio::time::sleep_until(self.ack_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if self.ack_deadline.is_some() => {
+                    log::warn!(
+                        "releasing capture: client {:?} did not acknowledge within {ACK_TIMEOUT:?}",
+                        self.active_client
+                    );
+                    self.release_capture(capture).await?;
+                },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
+                    CaptureRequest::PrepareFileDrag(handle) => { let _ = self.conn.send(ProtoEvent::Ping, handle).await; },
+                    CaptureRequest::StartFileDrag(handle, source_pid) => {
+                        if self.active_client == Some(handle) && !self.file_drag_button && !self.file_drag_released {
+                            self.file_drag_button = true;
+                            if matches!(self.state, State::Sending) { self.send_file_drag_button(handle, 1).await; }
+                            #[cfg(target_os = "macos")]
+                            if let Some(pid) = source_pid { input_capture::cancel_source_file_drag(pid); }
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = source_pid;
+                        }
+                    },
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
+                    CaptureRequest::Create(h, p, t, m) => {
+                        self.add_capture(h, p, t, m);
                         capture.create(h, p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
-                        // If the capture we're tearing down is the
-                        // currently-active one, treat this as a
-                        // release for hook purposes. The release_capture
-                        // path also clears active_client and flushes
-                        // pressed-key state to the peer; without this,
-                        // `cli deactivate` (or a hostname change
-                        // re-creating the client) would skip leave_hook.
+                        // deactivated while the cursor was on it
                         if self.active_client == Some(h) {
                             self.release_capture(capture).await?;
                         }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
+                    }
+                    CaptureRequest::SetSharingShortcut(shortcut) => {
+                        self.sharing_shortcut = shortcut.and_then(crate::sharing_shortcut::CaptureShortcut::new);
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -337,6 +486,20 @@ impl CaptureTask {
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
+        if matches!(event, CaptureEvent::Begin { .. }) {
+            self.file_drag_released = false;
+        }
+        if matches!(
+            event,
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                button: input_event::BTN_LEFT,
+                state: 0,
+                ..
+            }))
+        ) {
+            self.file_drag_button = false;
+            self.file_drag_released = true;
+        }
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -344,7 +507,7 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        if event == CaptureEvent::Begin {
+        if matches!(event, CaptureEvent::Begin { .. }) {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
@@ -362,9 +525,44 @@ impl CaptureTask {
             return Ok(());
         }
 
+        if matches!(event, CaptureEvent::Begin { .. }) {
+            match self.enter_backoff.get(&handle) {
+                Some(until) if Instant::now() < *until => {
+                    log::debug!("not entering client {handle}: last Enter failed a moment ago");
+                    capture.release().await?;
+                    return Ok(());
+                }
+                _ => {
+                    self.enter_backoff.remove(&handle);
+                }
+            }
+        }
+
+        let sharing_shortcut = match event {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) => self
+                .sharing_shortcut
+                .as_ref()
+                .filter(|shortcut| {
+                    shortcut.matches(key, state, Instant::now(), |key| {
+                        capture.keys_pressed(&[key])
+                    })
+                })
+                .map(|shortcut| shortcut.shortcut),
+            _ => None,
+        };
+        if let Some(shortcut) = sharing_shortcut {
+            // Release forwarded modifiers before returning control to the local UI.
+            self.release_capture(capture).await?;
+            self.event_tx
+                .send(ICaptureEvent::SharingShortcutPressed(shortcut))
+                .expect("channel closed");
+            return Ok(());
+        }
+
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
+        if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
+            #[cfg(target_os = "macos")]
+            crate::mouse_engine::sending(true).await;
             self.active_client.replace(handle);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
@@ -374,36 +572,69 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin { cross_axis } => {
+                let serial = self.next_transition_serial;
+                self.next_transition_serial = self.next_transition_serial.wrapping_add(1).max(1);
+                let event = if self.conn.supports_enter_with_position(handle) {
+                    ProtoEvent::EnterWithPosition {
+                        pos: opposite_pos,
+                        cross_axis,
+                        epoch: self.transition_epoch,
+                        serial,
+                    }
+                } else {
+                    ProtoEvent::Enter(opposite_pos)
+                };
+                let serial = matches!(event, ProtoEvent::EnterWithPosition { .. })
+                    .then_some(serial)
+                    .unwrap_or(0);
+                self.state = State::WaitingForAck { serial, event };
+                self.ack_deadline = Some(tokio::time::Instant::now() + ACK_TIMEOUT);
+                event
+            }
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::WaitingForAck { event, .. } => event,
+                State::Sending => ProtoEvent::Input(self.remap(handle, e)),
             },
         };
 
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            // Funnel through release_capture so the leave_hook
-            // fires and active_client is cleared (without this the
-            // active_client field would stay stale until the next
-            // Begin from a different handle).
+            self.enter_backoff
+                .insert(handle, Instant::now() + ENTER_BACKOFF);
+            // full release, not just the barrier: the cursor is back here, so
+            // the leave hook must run. `active_client` is taken on the first
+            // failure, later ones while the peer stays unreachable are cheap.
             self.release_capture(capture).await?;
         }
         Ok(())
     }
 
+    async fn send_file_drag_button(&self, handle: CaptureHandle, state: u32) {
+        let event = ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state: if state == 1 {
+                input_event::BUTTON_ADOPT_FILE_DRAG
+            } else {
+                state
+            },
+        }));
+        if let Err(e) = self.conn.send(event, handle).await {
+            log::warn!("file-drag button: {e}");
+        }
+    }
+
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.ack_deadline = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
-            // Surface the leave to the service layer so it can fire
-            // the per-client leave_hook. Sent before the network
-            // teardown below so we never race against the peer
-            // disappearing.
-            self.event_tx
-                .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
+            if self.file_drag_button {
+                self.send_file_drag_button(handle, 0).await;
+            }
+            self.file_drag_button = false;
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -415,11 +646,14 @@ impl CaptureTask {
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
             for key in capture.take_pressed_keys() {
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key: key as u32,
-                    state: 0,
-                }));
+                let key_up = ProtoEvent::Input(self.remap(
+                    handle,
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key: key as u32,
+                        state: 0,
+                    }),
+                ));
                 if let Err(e) = self.conn.send(key_up, handle).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
                 }
@@ -443,20 +677,73 @@ impl CaptureTask {
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+            self.event_tx
+                .send(ICaptureEvent::ClientLeft(handle))
+                .expect("channel closed");
         }
-        capture.release().await
+        let result = capture.release().await;
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::sending(false).await;
+        result
     }
+}
+
+/// XKB-style modifier bit produced by a key, if it is a modifier
+/// (bit layout shared by the capture and emulation backends)
+fn modifier_bit(key: u32) -> Option<u32> {
+    use scancode::Linux::*;
+    Some(match scancode::Linux::try_from(key).ok()? {
+        KeyLeftShift | KeyRightShift => 1 << 0,
+        KeyCapsLock => 1 << 1,
+        KeyLeftCtrl | KeyRightCtrl => 1 << 2,
+        KeyLeftAlt | KeyRightalt => 1 << 3,
+        KeyLeftMeta | KeyRightmeta => 1 << 6,
+        _ => return None,
+    })
+}
+
+/// move modifier bits according to the key map, e.g. Ctrl->Meta moves
+/// the ControlMask bit to Mod4Mask
+// ponytail: left/right variants share a bit, so mapping only KeyLeftCtrl
+// also moves the bit when KeyRightCtrl is held; split masks if that matters
+fn remap_modifier_mask(mods: u32, map: &KeyMap) -> u32 {
+    let (mut clear, mut set) = (0, 0);
+    for (&from, &to) in map {
+        let Some(from_bit) = modifier_bit(from) else {
+            continue;
+        };
+        if mods & from_bit == 0 {
+            continue;
+        }
+        clear |= from_bit;
+        set |= modifier_bit(to).unwrap_or(0);
+    }
+    (mods & !clear) | set
 }
 
 thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum State {
-    #[default]
-    WaitingForAck,
+    WaitingForAck { serial: u32, event: ProtoEvent },
     Sending,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::WaitingForAck {
+            serial: 0,
+            event: ProtoEvent::Enter(lan_mouse_proto::Position::Left),
+        }
+    }
+}
+
+impl State {
+    fn acknowledges(self, serial: u32) -> bool {
+        matches!(self, Self::WaitingForAck { serial: expected, .. } if serial == expected)
+    }
 }
 
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
@@ -466,6 +753,13 @@ fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
         lan_mouse_ipc::Position::Top => input_capture::Position::Top,
         lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
     }
+}
+
+fn transition_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
@@ -495,5 +789,49 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KeyMap, State, remap_modifier_mask};
+    use input_event::scancode::Linux::*;
+    use lan_mouse_proto::{Position, ProtoEvent};
+
+    #[test]
+    fn swapping_ctrl_and_meta_moves_modifier_bits() {
+        let map: KeyMap = [
+            (KeyLeftCtrl as u32, KeyLeftMeta as u32),
+            (KeyLeftMeta as u32, KeyLeftCtrl as u32),
+        ]
+        .into_iter()
+        .collect();
+        const CTRL: u32 = 1 << 2;
+        const META: u32 = 1 << 6;
+        const SHIFT: u32 = 1 << 0;
+        assert_eq!(remap_modifier_mask(CTRL, &map), META);
+        assert_eq!(remap_modifier_mask(META, &map), CTRL);
+        assert_eq!(remap_modifier_mask(CTRL | META, &map), CTRL | META);
+        assert_eq!(remap_modifier_mask(SHIFT | CTRL, &map), SHIFT | META);
+        // non-modifier mapping (CapsLock -> Esc) drops the lock bit
+        let caps: KeyMap = [(KeyCapsLock as u32, KeyEsc as u32)].into_iter().collect();
+        assert_eq!(remap_modifier_mask(1 << 1, &caps), 0);
+        assert_eq!(remap_modifier_mask(0, &map), 0);
+    }
+
+    #[test]
+    fn waiting_for_ack_only_accepts_the_pending_transition() {
+        let state = State::WaitingForAck {
+            serial: 9,
+            event: ProtoEvent::EnterWithPosition {
+                pos: Position::Left,
+                cross_axis: Some(0.5),
+                epoch: 1,
+                serial: 9,
+            },
+        };
+
+        assert!(state.acknowledges(9));
+        assert!(!state.acknowledges(8));
     }
 }

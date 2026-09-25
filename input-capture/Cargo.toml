@@ -48,7 +48,7 @@ ashpd = { version = "0.13.9", default-features = false, features = [
 reis = { version = "0.7.0", features = ["tokio"], optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
-core-graphics = { version = "0.25.0", features = ["highsierra"] }
+core-graphics = { version = "0.25.0", features = ["highsierra", "elcapitan"] }
 core-foundation = "0.10.0"
 core-foundation-sys = "0.8.6"
 libc = "0.2.155"
@@ -75,3 +75,6 @@ layer_shell = [
 ]
 x11 = ["dep:x11"]
 libei = ["dep:reis", "dep:ashpd"]
+
+[dev-dependencies]
+tokio = { version = "1.32.0", features = ["test-util"] }

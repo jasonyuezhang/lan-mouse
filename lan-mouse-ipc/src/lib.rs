@@ -140,8 +140,12 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
-    /// leave hook
+    /// leave hook: shell command run when the cursor returns from this client
+    #[serde(default)]
     pub leave_cmd: Option<String>,
+    /// key remapping (evdev keycode -> evdev keycode) applied to input sent to this client
+    #[serde(default)]
+    pub key_map: HashMap<u32, u32>,
 }
 
 impl Default for ClientConfig {
@@ -153,6 +157,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            key_map: Default::default(),
         }
     }
 }
@@ -185,10 +190,16 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    pub peer_supports_enter_with_position: bool,
+    /// Runtime-only negotiation; this does not change the frontend IPC format.
+    #[serde(skip)]
+    pub peer_supports_source_key_repeat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    /// Local input started controlling a peer. Used by the native drag bridge.
+    CaptureEntered { handle: ClientHandle },
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -224,12 +235,36 @@ pub enum FrontendEvent {
     },
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
+    /// A locally configured sharing shortcut was consumed during input capture.
+    SharingShortcutPressed { key_code: u32, modifiers: u32 },
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    /// macOS file-drag handoff lease; expires after 1500 ms.
+    SetFileDragReady(bool),
+    /// Connect without capturing input so a file can be staged at the edge.
+    PrepareFileDrag(ClientHandle),
+    /// Begin forwarding the held left button after a file drag crosses.
+    StartFileDrag(ClientHandle),
+    /// Start a file drag and cancel its source application's local drag.
+    StartFileDragFrom {
+        handle: ClientHandle,
+        source_pid: i32,
+    },
+    /// Deliver a native drag's initial click only to the local relay window.
+    BeginNativeFileDrag {
+        pid: i32,
+        window: i32,
+        x: i32,
+        y: i32,
+    },
+    /// End an abandoned local relay using the daemon's Accessibility grant.
+    CancelNativeFileDrag { pid: i32 },
+    /// Refresh the macOS control panel shortcut lease (10 seconds); None clears it.
+    SetSharingShortcut(Option<SharingShortcut>),
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client
@@ -262,10 +297,19 @@ pub enum FrontendRequest {
     RemoveAuthorizedKey(String),
     /// change the hook command
     UpdateEnterHook(u64, Option<String>),
+    /// Replace per-client keyboard and mouse-button mappings.
+    UpdateKeyMap(ClientHandle, HashMap<u32, u32>),
     /// change the leave hook command
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+}
+
+/// macOS virtual key code and NSEvent device-independent modifier flags.
+#[derive(Debug, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+pub struct SharingShortcut {
+    pub key_code: u32,
+    pub modifiers: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

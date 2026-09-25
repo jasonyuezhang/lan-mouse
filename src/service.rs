@@ -6,6 +6,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    hooks::{HookState, Hooks},
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
@@ -21,7 +22,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{signal, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -44,6 +45,8 @@ pub struct Service {
     emulation: Emulation,
     /// dns resolver
     resolver: DnsResolver,
+    /// enter / leave hook runner
+    hooks: Hooks,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -76,6 +79,28 @@ struct Incoming {
     pos: Position,
 }
 
+/// Resolves on Ctrl+C, and on unix also on SIGTERM — what launchd / systemd
+/// send on stop or restart. Without it the daemon just died: no `Leave` to
+/// the peer (it kept our keys held until its watchdog) and no leave hook.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                r = signal::ctrl_c() => r.expect("failed to wait for CTRL+C"),
+                _ = term.recv() => log::info!("received SIGTERM"),
+            },
+            Err(e) => {
+                log::warn!("failed to install SIGTERM handler: {e}");
+                signal::ctrl_c().await.expect("failed to wait for CTRL+C");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    signal::ctrl_c().await.expect("failed to wait for CTRL+C");
+}
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
@@ -94,7 +119,11 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            authorized_keys.clone(),
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -112,6 +141,7 @@ impl Service {
             emulation,
             frontend_listener,
             resolver,
+            hooks: Hooks::new(),
             authorized_keys,
             public_key_fingerprint,
             client_manager,
@@ -140,6 +170,8 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -148,17 +180,24 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                _ = &mut shutdown => break,
             }
         }
 
         log::info!("terminating service ...");
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
+        // the capture releases a still-active client on the way out; handle
+        // what it emitted (ClientLeft => leave hook) now that the loop is gone
+        while let Some(event) = self.capture.try_event() {
+            self.handle_capture_event(event);
+        }
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating hooks ...");
+        self.hooks.terminate().await;
 
         Ok(())
     }
@@ -214,6 +253,53 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::UpdateKeyMap(handle, key_map) => {
+                let Some((_, state)) = self.client_manager.get_state(handle) else {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+                    return;
+                };
+                if !valid_key_map(&key_map) {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Map keyboard keys to keys, and mouse buttons to mouse buttons".into(),
+                    ));
+                    return;
+                }
+                if state.active {
+                    self.deactivate_client(handle);
+                }
+                self.client_manager.set_key_map(handle, key_map);
+                if state.active {
+                    self.activate_client(handle);
+                }
+                self.broadcast_client(handle);
+                self.save_config();
+            }
+            FrontendRequest::SetFileDragReady(ready) => {
+                #[cfg(target_os = "macos")]
+                input_capture::set_file_drag_ready(ready);
+                #[cfg(not(target_os = "macos"))]
+                let _ = ready;
+            }
+            FrontendRequest::PrepareFileDrag(handle) => self.capture.prepare_file_drag(handle),
+            FrontendRequest::StartFileDrag(handle) => self.capture.start_file_drag(handle, None),
+            FrontendRequest::StartFileDragFrom { handle, source_pid } => {
+                self.capture.start_file_drag(handle, Some(source_pid))
+            }
+            FrontendRequest::BeginNativeFileDrag { pid, window, x, y } => {
+                #[cfg(target_os = "macos")]
+                input_capture::begin_native_file_drag(pid, window, x, y);
+                #[cfg(not(target_os = "macos"))]
+                let _ = (pid, window, x, y);
+            }
+            FrontendRequest::CancelNativeFileDrag { pid } => {
+                #[cfg(target_os = "macos")]
+                input_capture::cancel_source_file_drag(pid);
+                #[cfg(not(target_os = "macos"))]
+                let _ = pid;
+            }
+            FrontendRequest::SetSharingShortcut(shortcut) => {
+                self.capture.set_sharing_shortcut(shortcut)
+            }
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
                 self.update_leave_hook(handle, leave_hook)
             }
@@ -226,13 +312,14 @@ impl Service {
         let clients = clients
             .into_iter()
             .map(|(c, s)| ConfigClient {
-                ips: HashSet::from_iter(c.fix_ips),
+                ips: c.fix_ips,
                 hostname: c.hostname,
                 port: c.port,
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                key_map: c.key_map,
             })
             .collect();
         self.config.set_clients(clients);
@@ -240,6 +327,9 @@ impl Service {
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "Settings applied but could not be saved: {e}"
+            )));
         }
     }
 
@@ -336,6 +426,12 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::SharingShortcutPressed(shortcut) => {
+                self.notify_frontend(FrontendEvent::SharingShortcutPressed {
+                    key_code: shortcut.key_code,
+                    modifiers: shortcut.modifiers,
+                });
+            }
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
@@ -352,12 +448,15 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
+                self.notify_frontend(FrontendEvent::CaptureEntered { handle });
                 log::info!("entering client {handle} ...");
-                self.spawn_hook_command(handle, HookKind::Enter);
+                let cmd = self.client_manager.get_enter_cmd(handle);
+                self.hooks.run(handle, HookState::Entered, cmd);
             }
             ICaptureEvent::ClientLeft(handle) => {
-                log::info!("leaving client {handle} ...");
-                self.spawn_hook_command(handle, HookKind::Leave);
+                log::info!("left client {handle}");
+                let cmd = self.client_manager.get_leave_cmd(handle);
+                self.hooks.run(handle, HookState::Left, cmd);
             }
         }
     }
@@ -404,7 +503,8 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        self.capture
+            .create(handle, pos, CaptureType::EnterOnly, Default::default());
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -523,7 +623,9 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            let key_map = self.client_manager.get_key_map(handle);
+            self.capture
+                .create(handle, pos, CaptureType::Default, key_map);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -568,8 +670,12 @@ impl Service {
     }
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        let active = self
+            .client_manager
+            .get_state(handle)
+            .is_some_and(|(_, state)| state.active);
         // update state in event input emulator & input capture
-        if self.client_manager.set_pos(handle, pos) {
+        if self.client_manager.set_pos(handle, pos) && active {
             self.deactivate_client(handle);
             self.activate_client(handle);
         }
@@ -594,47 +700,33 @@ impl Service {
             .unwrap_or(FrontendEvent::NoSuchClient(handle));
         self.notify_frontend(event);
     }
-
-    fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {
-        let cmd = match kind {
-            HookKind::Enter => self.client_manager.get_enter_cmd(handle),
-            HookKind::Leave => self.client_manager.get_leave_cmd(handle),
-        };
-        let Some(cmd) = cmd else { return };
-        tokio::task::spawn_local(async move {
-            log::info!("spawning {kind} hook for client {handle}");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute {kind} hook for client {handle}: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{kind} hook for client {handle} ({cmd}) exited successfully");
-                    } else {
-                        log::warn!("{kind} hook for client {handle} ({cmd}) exited with {s}");
-                    }
-                }
-                Err(e) => log::warn!("{kind} hook for client {handle} ({cmd}): {e}"),
-            }
-        });
-    }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum HookKind {
-    Enter,
-    Leave,
-}
-
-impl std::fmt::Display for HookKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HookKind::Enter => f.write_str("enter"),
-            HookKind::Leave => f.write_str("leave"),
+fn valid_key_map(map: &HashMap<u32, u32>) -> bool {
+    use input_event::{BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, scancode};
+    let button = |code| {
+        matches!(
+            code,
+            BTN_LEFT | BTN_RIGHT | BTN_MIDDLE | BTN_BACK | BTN_FORWARD
+        )
+    };
+    map.iter().all(|(&from, &to)| {
+        if button(from) || button(to) {
+            button(from) && button(to)
+        } else {
+            scancode::Linux::try_from(from).is_ok() && scancode::Linux::try_from(to).is_ok()
         }
+    })
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    #[test]
+    fn only_persistable_mappings_are_accepted() {
+        assert!(valid_key_map(&HashMap::from([(125, 29), (274, 275)])));
+        assert!(!valid_key_map(&HashMap::from([(274, 29)])));
+        assert!(!valid_key_map(&HashMap::from([(29, 274)])));
+        assert!(!valid_key_map(&HashMap::from([(u32::MAX, 29)])));
     }
 }

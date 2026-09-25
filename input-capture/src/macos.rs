@@ -2,24 +2,32 @@ use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCr
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
+    array::CFArray,
+    base::{CFRelease, CFType, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
-    number::{CFBooleanRef, kCFBooleanTrue},
+    dictionary::CFDictionary,
+    number::{CFBooleanRef, CFNumber, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
-    string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+    string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
     display::{CGDisplay, CGPoint},
     event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-        CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, CGMouseButton, CallbackResult,
+        EventField,
     },
     event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::CGRect,
+    window::{
+        copy_window_info, kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly,
+    },
 };
 use futures_core::Stream;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    screen::{Edge, EdgeSegments, Rect},
 };
 use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
@@ -29,8 +37,9 @@ use std::{
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     thread::{self},
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Mutex,
@@ -38,12 +47,169 @@ use tokio::sync::{
     oneshot,
 };
 
+static FILE_DRAG_CLOCK: OnceLock<Instant> = OnceLock::new();
+const LOCAL_FILE_DRAG_TAG: i64 = 0x4c4d4443414e434c; // LMDCANCL
+static FILE_DRAG_READY_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn file_drag_clock() -> u64 {
+    FILE_DRAG_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+pub fn set_file_drag_ready(ready: bool) {
+    FILE_DRAG_READY_UNTIL.store(
+        if ready { file_drag_clock() + 1500 } else { 0 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+fn file_drag_ready() -> bool {
+    let until = FILE_DRAG_READY_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && file_drag_clock() < until
+}
+
+/// End the source application's drag using the daemon's existing Accessibility
+/// permission. Process-addressed events never enter the shared input stream.
+pub fn cancel_source_file_drag(pid: i32) {
+    if pid <= 0 || pid == std::process::id() as i32 {
+        return;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::Private) else {
+        log::warn!("could not create source-drag cancellation event source");
+        return;
+    };
+    let (Ok(down), Ok(up)) = (
+        CGEvent::new_keyboard_event(source.clone(), 53, true),
+        CGEvent::new_keyboard_event(source, 53, false),
+    ) else {
+        log::warn!("could not create source-drag cancellation events");
+        return;
+    };
+    for event in [down, up] {
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LOCAL_FILE_DRAG_TAG);
+        event.post_to_pid(pid);
+    }
+    log::info!("sent source file drag cancellation to process {pid}");
+}
+
+/// Refuse to click until the relay is the frontmost window at the click point.
+fn relay_covers_point(pid: i32, window: i32, point: CGPoint) -> bool {
+    unsafe extern "C" {
+        fn CGWindowLevelForKey(key: i32) -> i32;
+    }
+    // kCGCursorWindowLevelKey. Quartz includes the pointer image in its list;
+    // that image cannot intercept a click and must not hide the relay from us.
+    let cursor_level = i64::from(unsafe { CGWindowLevelForKey(19) });
+    let Some(list) = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        0,
+    ) else {
+        return false;
+    };
+    // Quartz documents this array as dictionaries with CFString keys.
+    let list: CFArray<CFDictionary<CFString, CFType>> =
+        unsafe { CFArray::wrap_under_get_rule(list.as_concrete_TypeRef()) };
+    for info in list.iter() {
+        let number = |key: &str| {
+            info.find(CFString::new(key))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_i64())
+        };
+        if number("kCGWindowLayer") == Some(cursor_level) {
+            continue;
+        }
+        let bounds = info
+            .find(CFString::new("kCGWindowBounds"))
+            .and_then(|v| v.downcast::<CFDictionary>())
+            .and_then(|d| CGRect::from_dict_representation(&d));
+        if bounds.is_some_and(|r| r.contains(&point)) {
+            let covers = number("kCGWindowOwnerPID") == Some(i64::from(pid))
+                && number("kCGWindowNumber") == Some(i64::from(window));
+            if !covers {
+                log::debug!(
+                    "native drag window {window} at {point:?} is covered by window {:?}, owner {:?}, layer {:?}",
+                    number("kCGWindowNumber"),
+                    number("kCGWindowOwnerPID"),
+                    number("kCGWindowLayer")
+                );
+            }
+            return covers;
+        }
+    }
+    false
+}
+
+/// Establish WindowServer mouse tracking only after the relay covers the click.
+/// Process-addressed events neither select a dispatch window nor hold the global
+/// button state; a drag started with them ends at its first motion event.
+pub fn begin_native_file_drag(pid: i32, window: i32, x: i32, y: i32) -> bool {
+    if pid <= 0 || pid == std::process::id() as i32 || window <= 0 {
+        return false;
+    }
+    let point = CGPoint::new(f64::from(x), f64::from(y));
+    if !relay_covers_point(pid, window, point) {
+        return false;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        log::warn!("could not create native file drag event source");
+        return false;
+    };
+    let Ok(event) = CGEvent::new_mouse_event(
+        source,
+        CGEventType::LeftMouseDown,
+        point,
+        CGMouseButton::Left,
+    ) else {
+        log::warn!("could not create native file drag mouse-down");
+        return false;
+    };
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LOCAL_FILE_DRAG_TAG);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+    // A late UI activation must not resurrect a released drag. Retried startup
+    // requests may only inject one press for this held-button lifetime.
+    if !input_event::macos::claim_file_drag_button() {
+        return false;
+    }
+    event.post(CGEventTapLocation::HID);
+    log::info!("started native file drag over verified relay window {window}, process {pid}");
+    true
+}
+
+/// A tap disabled by timeout this often within this window is not having a
+/// one-off stall; stop re-enabling it and tear down instead
+const TAP_TIMEOUTS_FATAL: usize = 3;
+const TAP_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
+
+/// Union of all displays. `xmin`/`ymin` is the first visible pixel,
+/// `xmax`/`ymax` is one past the last.
 #[derive(Debug, Default)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+impl Bounds {
+    /// Does a pointer at `location` moving by `delta` leave the desktop on
+    /// `position`'s side?
+    ///
+    /// Strict on all four sides: the pointer has to be pushed *past* the outer
+    /// pixel, sitting on it is not enough. The event tap also sees the events
+    /// our own emulation posts, and a peer's positioned `Enter` warps the
+    /// cursor exactly onto `xmin`/`ymin` with a zero delta. With `<=` that
+    /// warp tripped our own barrier, which told the peer to release, whose
+    /// warp tripped its barrier, ... — a visible enter/leave ping-pong at the
+    /// edge (and a hook storm) every time the cursor came back from a client
+    /// under the peer's own mouse.
+    fn crosses(&self, position: Position, location: (f64, f64), delta: (f64, f64)) -> bool {
+        let (x, y) = (location.0 + delta.0, location.1 + delta.1);
+        match position {
+            Position::Left => x < self.xmin,
+            Position::Right => x >= self.xmax,
+            Position::Top => y < self.ymin,
+            Position::Bottom => y >= self.ymax,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -58,6 +224,9 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// recent `TapDisabledByTimeout` events, to tell a one-off stall from a
+    /// tap macOS keeps killing
+    tap_timeouts: Vec<Instant>,
 }
 
 #[derive(Debug)]
@@ -78,6 +247,7 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            tap_timeouts: Vec::new(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -89,16 +259,40 @@ impl InputCaptureState {
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
 
         for &position in self.active_clients.iter() {
-            if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
-                || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
-                || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
-                || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
+            if self
+                .bounds
+                .crosses(position, (location.x, location.y), (relative_x, relative_y))
             {
                 log::debug!("Crossed barrier into position: {position:?}");
                 return Some(position);
             }
         }
         None
+    }
+
+    /// Normalized position (0..=1) along the exposed desktop edge the cursor
+    /// is about to cross, so the peer can place the cursor at the same height / offset.
+    fn cross_axis(&self, event: &CGEvent, position: Position) -> Option<f32> {
+        let location = event.location();
+        let edge = match position {
+            Position::Left => Edge::Left,
+            Position::Right => Edge::Right,
+            Position::Top => Edge::Top,
+            Position::Bottom => Edge::Bottom,
+        };
+        let cross = match edge {
+            Edge::Left | Edge::Right => location.y,
+            Edge::Top | Edge::Bottom => location.x,
+        }
+        .round() as i32;
+        let segments = EdgeSegments::from_rectangles(edge, display_rectangles());
+        // the cursor may not sit exactly on the edge pixel yet; look the edge
+        // coordinate up from the segment covering our cross-axis position.
+        let edge_coordinate = segments
+            .segments()
+            .find(|s| cross >= s.cross_start && cross < s.cross_end)?
+            .edge_coordinate;
+        segments.normalize(edge_coordinate, cross)
     }
 
     // Get the max bounds of all displays
@@ -231,6 +425,9 @@ fn get_events(
 
     match ev_type {
         CGEventType::KeyDown => {
+            if ev.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+                return Ok(());
+            }
             let k = map_key(ev)?;
             result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
@@ -439,20 +636,50 @@ fn create_event_tap<'a>(
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
+        // Window-addressed drag events stay local, including while capturing.
+        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == LOCAL_FILE_DRAG_TAG
+        {
+            return CallbackResult::Keep;
+        }
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
         let mut res_events = vec![];
 
         if matches!(event_type, CGEventType::TapDisabledByTimeout) {
             // The kernel disables the tap when our callback runs
-            // longer than ~1s on a single event — typical causes
-            // are heavy load, scheduler contention, or this
-            // process being briefly suspended (e.g. App Nap on a
-            // long idle). It is NOT a fatal condition: Apple's
-            // documented recovery is to call CGEventTapEnable
-            // and resume processing. Re-enable in place and KEEP
-            // existing capture state so the user doesn't see the
-            // cursor pop back to the local screen mid-session.
+            // longer than ~1s on a single event — heavy load, this
+            // process briefly suspended, or the daemon's thread
+            // stalled while the callback waited on it. Apple's
+            // documented recovery is to re-enable the tap.
+            //
+            // But never while capturing: in that state every local
+            // event is dropped and the cursor is pinned to the edge,
+            // so resurrecting the tap with capture state intact keeps
+            // the desk frozen for as long as the trouble lasts (a
+            // revoked Accessibility permission made macOS kill the
+            // tap 12 times in 90 s while the user could do nothing).
+            // Give the desk back first; the peer's watchdog releases
+            // our keys. And if the tap keeps dying, stop pretending
+            // it is a one-off: tear down so the service can report it.
+            let now = Instant::now();
+            state
+                .tap_timeouts
+                .retain(|t| now.duration_since(*t) < TAP_TIMEOUT_WINDOW);
+            state.tap_timeouts.push(now);
+            if state.current_pos.is_some() {
+                log::warn!("CGEventTap disabled by timeout while capturing — releasing capture");
+                let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                state.current_pos = None;
+                let _ = notify_tx.try_send(ProducerEvent::Release);
+            }
+            if state.tap_timeouts.len() >= TAP_TIMEOUTS_FATAL {
+                log::error!(
+                    "CGEventTap disabled by timeout {} times within {TAP_TIMEOUT_WINDOW:?} — giving up on it",
+                    state.tap_timeouts.len()
+                );
+                let _ = notify_tx.try_send(ProducerEvent::EventTapDisabled);
+                return CallbackResult::Keep;
+            }
             if let Some(&port) = tap_mach_port_cb.get() {
                 log::warn!("CGEventTap disabled by timeout — re-enabling");
                 unsafe {
@@ -485,7 +712,7 @@ fn create_event_tap<'a>(
                 state.current_pos = None;
             }
             notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
+                .try_send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
                     log::error!("Failed to send notification: {e}");
                 });
@@ -515,25 +742,38 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
+        } else if matches!(event_type, CGEventType::MouseMoved)
+            || (matches!(event_type, CGEventType::LeftMouseDragged) && file_drag_ready())
+        {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
+                let cross_axis = state.cross_axis(cg_ev, new_pos);
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                res_events.push(CaptureEvent::Begin { cross_axis });
+                // a closed channel (instance being dropped) must not
+                // panic-abort the daemon from inside the tap callback
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    log::error!("failed to notify producer of capture start: {e}");
+                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
+                    state.current_pos = None;
+                    return CallbackResult::Keep;
+                }
             }
         }
 
         if let Some(pos) = capture_position {
+            // This callback runs inside the OS input path: if it blocks,
+            // macOS stalls all input, then kills the tap. When the
+            // daemon's thread is not keeping up, losing an event is far
+            // better than freezing the desk — so never block here.
             res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                if let Err(err) = event_tx.try_send((pos, *e)) {
+                    // closed when the instance is dropped, full when stalled
+                    log::debug!("dropping captured event: {err}");
+                }
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
@@ -545,7 +785,9 @@ fn create_event_tap<'a>(
     };
 
     let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
+        // The integrated MMF helper processes Session events. Capturing at HID
+        // guarantees raw input reaches exactly one Mac's mouse engine.
+        CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         cg_events_of_interest,
@@ -653,6 +895,8 @@ pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    key_repeat: super::key_repeat::KeyRepeat,
+    capture_state: Arc<Mutex<InputCaptureState>>,
 }
 
 impl MacOSInputCapture {
@@ -685,6 +929,7 @@ impl MacOSInputCapture {
         // wait for event tap creation result
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
+        let capture_state = state.clone();
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -708,8 +953,30 @@ impl MacOSInputCapture {
             event_rx,
             notify_tx,
             run_loop,
+            capture_state,
+            key_repeat: {
+                let (delay, interval) = input_event::macos::system_key_repeat();
+                super::key_repeat::KeyRepeat::new(delay, interval)
+            },
         })
     }
+}
+
+/// Bounds of every active display in global (CGEvent) coordinates.
+fn display_rectangles() -> Vec<Rect> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Rect {
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as i32,
+                height: b.size.height.round() as i32,
+            }
+        })
+        .collect()
 }
 
 fn request_macos_capture_permissions() -> Result<(), MacosCaptureCreationError> {
@@ -763,6 +1030,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("destroying capture {pos}");
@@ -773,6 +1041,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
@@ -782,6 +1051,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         Ok(())
     }
 }
@@ -790,9 +1060,41 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+        // Drain physical events before considering repeats, especially key-up.
+        match self.event_rx.poll_recv(cx) {
+            Poll::Ready(None) => {
+                self.key_repeat.clear();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some((pos, event))) => {
+                self.key_repeat.observe(pos, event);
+                Poll::Ready(Some(Ok((pos, event))))
+            }
+            Poll::Pending => match self.key_repeat.poll(cx) {
+                Poll::Ready((pos, event)) => {
+                    // A tap timeout or permission change may release capture
+                    // without delivering a key-up. Never repeat after that.
+                    let active = self
+                        .capture_state
+                        .try_lock()
+                        .ok()
+                        .map(|state| state.current_pos == Some(pos));
+                    match active {
+                        Some(true) => Poll::Ready(Some(Ok((pos, event)))),
+                        Some(false) => {
+                            self.key_repeat.clear();
+                            Poll::Pending
+                        }
+                        None => {
+                            // Skip this tick if the tap is updating its state.
+                            // Register the reset timer before yielding.
+                            let _ = self.key_repeat.poll(cx);
+                            Poll::Pending
+                        }
+                    }
+                }
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }
@@ -884,5 +1186,73 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bounds, Position};
+
+    // 1920x1080 main display with a 1440x900 one to its right; x: 0..3360
+    fn desktop() -> Bounds {
+        Bounds {
+            xmin: 0.0,
+            xmax: 3360.0,
+            ymin: 0.0,
+            ymax: 1080.0,
+        }
+    }
+
+    #[test]
+    fn a_peer_warping_us_onto_the_edge_pixel_is_not_a_crossing() {
+        let b = desktop();
+        // emulation.warp_cursor(): absolute MouseMoved onto the edge, no delta
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (0.0, 0.0)));
+        assert!(!b.crosses(Position::Top, (800.0, 0.0), (0.0, 0.0)));
+        // and neither is the peer then moving us inwards or along the edge
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (3.0, 0.0)));
+        assert!(!b.crosses(Position::Left, (0.0, 500.0), (0.0, -7.0)));
+    }
+
+    #[test]
+    fn pushing_past_the_edge_pixel_crosses() {
+        let b = desktop();
+        // macOS pins the location on the outer pixel; the delta keeps going
+        assert!(b.crosses(Position::Left, (0.0, 500.0), (-1.0, 0.0)));
+        assert!(b.crosses(Position::Top, (800.0, 0.0), (0.0, -1.0)));
+        assert!(b.crosses(Position::Right, (3359.0, 500.0), (1.0, 0.0)));
+        assert!(b.crosses(Position::Bottom, (800.0, 1079.0), (0.0, 1.0)));
+    }
+
+    #[test]
+    fn near_and_far_edges_behave_the_same() {
+        let b = desktop();
+        // sitting on the outer pixel with no delta: no crossing on any side
+        assert!(!b.crosses(Position::Right, (3359.0, 500.0), (0.0, 0.0)));
+        assert!(!b.crosses(Position::Bottom, (800.0, 1079.0), (0.0, 0.0)));
+        // well inside, large movement that stays inside
+        assert!(!b.crosses(Position::Left, (100.0, 500.0), (-99.0, 0.0)));
+        assert!(!b.crosses(Position::Right, (3000.0, 500.0), (359.0, 0.0)));
+    }
+
+    #[test]
+    fn only_the_configured_side_counts() {
+        let b = desktop();
+        assert!(!b.crosses(Position::Right, (0.0, 500.0), (-5.0, 0.0)));
+        assert!(!b.crosses(Position::Left, (3359.0, 500.0), (5.0, 0.0)));
+    }
+}
+
+#[cfg(test)]
+mod file_drag_tests {
+    use super::*;
+    #[test]
+    fn file_drag_permission_is_a_short_lived_lease() {
+        set_file_drag_ready(true);
+        assert!(file_drag_ready());
+        FILE_DRAG_READY_UNTIL.store(file_drag_clock(), std::sync::atomic::Ordering::Relaxed);
+        assert!(!file_drag_ready());
+        set_file_drag_ready(false);
+        assert!(!file_drag_ready());
     }
 }

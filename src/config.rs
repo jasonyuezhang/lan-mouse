@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::env::{self, VarError};
 use std::fmt::Display;
 use std::fs::{self, File};
+use std::io;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, io};
 use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
@@ -19,9 +19,12 @@ use toml_edit::{self, DocumentMut};
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{DEFAULT_PORT, Position};
 
-use input_event::scancode::{
-    self,
-    Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
+use input_event::{
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
+    scancode::{
+        self,
+        Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
+    },
 };
 
 use shadow_rs::shadow;
@@ -80,7 +83,45 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// shell command run when the cursor comes back from this client
     leave_hook: Option<String>,
+    /// per-client key remapping, e.g. `key_map = { KeyLeftMeta = "KeyLeftCtrl" }`
+    key_map: Option<HashMap<scancode::Linux, scancode::Linux>>,
+    /// per-client mouse button remapping, e.g. `button_map = { Middle = "Back" }`
+    button_map: Option<HashMap<MouseButton, MouseButton>>,
+}
+
+/// Mouse button names accepted in `button_map`
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq, Hash)]
+enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+impl MouseButton {
+    fn code(self) -> u32 {
+        match self {
+            Self::Left => BTN_LEFT,
+            Self::Right => BTN_RIGHT,
+            Self::Middle => BTN_MIDDLE,
+            Self::Back => BTN_BACK,
+            Self::Forward => BTN_FORWARD,
+        }
+    }
+
+    fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            BTN_LEFT => Self::Left,
+            BTN_RIGHT => Self::Right,
+            BTN_MIDDLE => Self::Middle,
+            BTN_BACK => Self::Back,
+            BTN_FORWARD => Self::Forward,
+            _ => return None,
+        })
+    }
 }
 
 impl ConfigToml {
@@ -270,13 +311,15 @@ pub struct Config {
 }
 
 pub struct ConfigClient {
-    pub ips: HashSet<IpAddr>,
+    pub ips: Vec<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    /// evdev keycode -> evdev keycode, applied before sending to this client
+    pub key_map: HashMap<u32, u32>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -284,8 +327,21 @@ impl From<TomlClient> for ConfigClient {
         let active = toml.activate_on_startup.unwrap_or(false);
         let enter_hook = toml.enter_hook;
         let leave_hook = toml.leave_hook;
+        // keys and buttons share the evdev code space, so one map covers both
+        let key_map = toml
+            .key_map
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(from, to)| (from as u32, to as u32))
+            .chain(
+                toml.button_map
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(from, to)| (from.code(), to.code())),
+            )
+            .collect();
         let hostname = toml.hostname;
-        let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
+        let ips = toml.ips.unwrap_or_default();
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
         Self {
@@ -296,6 +352,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            key_map,
         }
     }
 }
@@ -303,10 +360,28 @@ impl From<TomlClient> for ConfigClient {
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
+        let button_map: HashMap<_, _> = client
+            .key_map
+            .iter()
+            .filter_map(|(&from, &to)| {
+                Some((MouseButton::from_code(from)?, MouseButton::from_code(to)?))
+            })
+            .collect();
+        let key_map: HashMap<_, _> = client
+            .key_map
+            .into_iter()
+            .filter(|(from, _)| MouseButton::from_code(*from).is_none())
+            .filter_map(|(from, to)| {
+                Some((
+                    scancode::Linux::try_from(from).ok()?,
+                    scancode::Linux::try_from(to).ok()?,
+                ))
+            })
+            .collect();
+        let key_map = (!key_map.is_empty()).then_some(key_map);
+        let button_map = (!button_map.is_empty()).then_some(button_map);
         let host_name = None;
-        let mut ips = client.ips.into_iter().collect::<Vec<_>>();
-        ips.sort();
-        let ips = Some(ips);
+        let ips = Some(client.ips);
         let port = if client.port == DEFAULT_PORT {
             None
         } else {
@@ -325,6 +400,8 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            key_map,
+            button_map,
         }
     }
 }
@@ -502,9 +579,6 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
@@ -582,5 +656,91 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scancode::Linux::*;
+
+    #[test]
+    fn removing_last_client_persists_without_removing_trust() {
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-remove-last-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (_, watch_rx) = tokio::sync::mpsc::channel(1);
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: dir.join("identity.pem"),
+            config_path: dir.join("config.toml"),
+            config_dir: dir.clone(),
+            config_toml: Some(toml::from_str(
+                "[[clients]]\nhostname = \"other.local\"\n[authorized_fingerprints]\ntrusted = \"Other Mac\""
+            ).unwrap()),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx,
+        };
+        config.set_clients(vec![]);
+        config.write_back().unwrap();
+        let saved = ConfigToml::new(&config.config_path).unwrap();
+        assert!(saved.clients.unwrap().is_empty());
+        assert_eq!(
+            saved.authorized_fingerprints.unwrap()["trusted"],
+            "Other Mac"
+        );
+        drop(config);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn key_map_round_trips_through_toml_with_readable_names() {
+        let toml_src = r#"
+[[clients]]
+hostname = "mbp"
+position = "left"
+key_map = { KeyLeftMeta = "KeyLeftCtrl", KeyLeftCtrl = "KeyLeftMeta", KeyCapsLock = "KeyEsc" }
+button_map = { Middle = "Back", Left = "Right" }
+"#;
+        let parsed: ConfigToml = toml::from_str(toml_src).expect("parse");
+        let client: ConfigClient = parsed.clients.unwrap().remove(0).into();
+        assert_eq!(client.key_map[&(KeyLeftMeta as u32)], KeyLeftCtrl as u32);
+        assert_eq!(client.key_map[&(KeyCapsLock as u32)], KeyEsc as u32);
+        assert_eq!(client.key_map[&BTN_MIDDLE], BTN_BACK);
+        assert_eq!(client.key_map[&BTN_LEFT], BTN_RIGHT);
+        assert_eq!(client.key_map.len(), 5);
+
+        // and back: save-config must not lose it, and buttons go back to button_map
+        let back: TomlClient = client.into();
+        let out = toml::to_string(&back).expect("serialize");
+        assert!(out.contains("KeyCapsLock = \"KeyEsc\""), "{out}");
+        assert!(out.contains("Middle = \"Back\""), "{out}");
+        assert_eq!(back.key_map.as_ref().unwrap().len(), 3);
+        assert_eq!(back.button_map.as_ref().unwrap().len(), 2);
+
+        // absent key_map stays absent (no noisy `key_map = {}` in saved config)
+        let plain: ConfigToml = toml::from_str("[[clients]]\nposition = \"right\"").unwrap();
+        let back: TomlClient = ConfigClient::from(plain.clients.unwrap().remove(0)).into();
+        assert!(back.key_map.is_none());
+        assert!(back.button_map.is_none());
+    }
+    #[test]
+    fn configured_ip_priority_survives_round_trip() {
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+[[clients]]
+ips = ["192.168.68.57", "10.20.20.2"]
+"#,
+        )
+        .unwrap();
+        let original = parsed.clients.unwrap().remove(0);
+        let saved: TomlClient = ConfigClient::from(original.clone()).into();
+        assert_eq!(saved.ips, original.ips);
     }
 }

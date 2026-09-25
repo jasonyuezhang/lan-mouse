@@ -1,18 +1,20 @@
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{Emulation, EmulationHandle, WarpPosition, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
     ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use foreign_types::ForeignType;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
+    screen::{Edge, EdgeSegments, Rect},
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -24,8 +26,15 @@ use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
-const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
-const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+// Must match Mac Mouse Fix's kMFLanMouseEventTag. A tag identifies the
+// virtual device; it does not authorize a connection or enable the engine.
+const LAN_MOUSE_EVENT_TAG: i64 = 0x4c414e4d4f555345;
+
+fn post_remote_event(event: &CGEvent) {
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LAN_MOUSE_EVENT_TAG);
+    event.post(CGEventTapLocation::HID);
+}
+
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) struct MacOSEmulation {
@@ -35,6 +44,7 @@ pub(crate) struct MacOSEmulation {
     repeat_task: Option<JoinHandle<()>>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
+    file_drag_owner: Option<EmulationHandle>,
     /// button previously pressed (evdev button code)
     previous_button: Option<u32>,
     /// timestamp of previous click (button down)
@@ -45,6 +55,9 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Rc<Cell<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
+    /// the user's key repeat settings on this machine
+    repeat_delay: Duration,
+    repeat_interval: Duration,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -57,6 +70,14 @@ fn drag_event_type(button: u32) -> CGEventType {
     }
 }
 
+fn adopt_file_drag(pressed: &mut HashSet<u32>, button: u32, state: u32) -> bool {
+    if button != BTN_LEFT || state != input_event::BUTTON_ADOPT_FILE_DRAG {
+        return false;
+    }
+    pressed.insert(BTN_LEFT);
+    true
+}
+
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
@@ -65,16 +86,31 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        permit_local_input_while_emulating(&event_source);
+        let (repeat_delay, repeat_interval) = input_event::macos::system_key_repeat();
+        log::debug!("key repeat: delay {repeat_delay:?}, interval {repeat_interval:?}");
         Ok(Self {
             event_source,
             pressed_buttons: HashSet::new(),
+            file_drag_owner: None,
             previous_button: None,
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
+            repeat_delay,
+            repeat_interval,
         })
+    }
+
+    /// Pointer events carry the peer's modifiers, like key events do. Inheriting
+    /// the event source's session flags instead can report a modifier the
+    /// sender no longer holds, which the mouse engine turns into zoom or
+    /// horizontal scrolling.
+    fn post_pointer_event(&self, event: &CGEvent) {
+        event.set_flags(to_cgevent_flags(self.modifier_state.get()));
+        post_remote_event(event);
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
@@ -92,17 +128,20 @@ impl MacOSEmulation {
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
+        let (delay, interval) = (self.repeat_delay, self.repeat_interval);
         let repeat_task = tokio::task::spawn_local(async move {
             let stop = tokio::select! {
-                _ = tokio::time::sleep(DEFAULT_REPEAT_DELAY) => false,
+                biased;
                 _ = notify.notified() => true,
+                _ = tokio::time::sleep(delay) => false,
             };
             if !stop {
                 loop {
                     key_event(event_source.clone(), key, 1, modifiers.get());
                     tokio::select! {
-                        _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
+                        biased;
                         _ = notify.notified() => break,
+                        _ = tokio::time::sleep(interval) => {},
                     }
                 }
             }
@@ -125,10 +164,15 @@ impl MacOSEmulation {
     }
 
     async fn cancel_repeat_task(&mut self) {
-        if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
-            let _ = task.await;
-        }
+        stop_repeat_task(&mut self.repeat_task, &self.notify_repeat_task).await;
+    }
+}
+
+async fn stop_repeat_task(task: &mut Option<JoinHandle<()>>, notify: &Notify) {
+    if let Some(task) = task.take() {
+        // Keep a permit if a queued release beats the task's first poll.
+        notify.notify_one();
+        let _ = task.await;
     }
 }
 
@@ -158,9 +202,36 @@ fn request_input_control_permission() -> bool {
     unsafe { CGPreflightPostEventAccess() }
 }
 
+/// After a synthetic event is posted, macOS suppresses the *local* mouse and
+/// keyboard for 0.25 s by default (measured: interval 0.25 s, filter mask 0).
+/// While a peer drives this machine every packet re-arms that lockout, so
+/// grabbing the local mouse or typing here loses the first quarter second.
+/// Let local input through, in both suppression states (post-event interval
+/// and synthetic drag) — a KVM user must always be able to take over.
+fn permit_local_input_while_emulating(source: &CGEventSource) {
+    // CGRemoteOperation.h
+    const PERMIT_ALL_EVENTS: u32 = 0x7; // kCGEventFilterMaskPermitAllEvents
+    const SUPPRESSION_INTERVAL: u32 = 0; // kCGEventSuppressionStateSuppressionInterval
+    const REMOTE_MOUSE_DRAG: u32 = 1; // kCGEventSuppressionStateRemoteMouseDrag
+    for state in [SUPPRESSION_INTERVAL, REMOTE_MOUSE_DRAG] {
+        unsafe {
+            CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+                source.as_ptr(),
+                PERMIT_ALL_EVENTS,
+                state,
+            );
+        }
+    }
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGEventSourceSetLocalEventsFilterDuringSuppressionState(
+        source: core_graphics::sys::CGEventSourceRef,
+        filter: u32,
+        state: u32,
+    );
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -197,8 +268,12 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     if is_arrow_key(key) {
         flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
     }
+    event.set_integer_value_field(
+        EventField::KEYBOARD_EVENT_AUTOREPEAT,
+        i64::from(state == input_event::KEY_REPEATED),
+    );
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_remote_event(&event);
     log::trace!("key event: {key} {state}");
 }
 
@@ -210,7 +285,7 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
+    post_remote_event(&event);
     log::trace!("modifiers updated: {depressed:?}");
 }
 
@@ -290,7 +365,7 @@ impl Emulation for MacOSEmulation {
     async fn consume(
         &mut self,
         event: Event,
-        _handle: EmulationHandle,
+        handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         log::trace!("{event:?}");
         match event {
@@ -333,13 +408,26 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                     PointerEvent::Button {
                         time: _,
                         button,
                         state,
                     } => {
+                        // The native relay owns the mouse-down in its own window.
+                        // A global down here can grab another app's resize border.
+                        if adopt_file_drag(&mut self.pressed_buttons, button, state) {
+                            if self.file_drag_owner != Some(handle) {
+                                input_event::macos::adopt_file_drag_button();
+                            }
+                            self.file_drag_owner = Some(handle);
+                            return Ok(());
+                        }
+                        if button == BTN_LEFT && state == 0 {
+                            input_event::macos::release_file_drag_button();
+                            self.file_drag_owner = None;
+                        }
                         // button number for OtherMouse events (3 = back, 4 = forward, etc.)
                         let cg_button_number: Option<i64> = match button {
                             BTN_BACK => Some(3),
@@ -413,7 +501,7 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                     PointerEvent::Axis {
                         time: _,
@@ -443,7 +531,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
@@ -469,7 +557,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        self.post_pointer_event(&event);
                     }
                 }
 
@@ -501,13 +589,33 @@ impl Emulation for MacOSEmulation {
                         },
                     };
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
+                    if is_modifier && state == input_event::KEY_REPEATED {
+                        return Ok(());
+                    }
                     if is_modifier {
                         modifier_event(self.event_source.clone(), self.modifier_state.get());
                     }
                     match state {
                         // pressed
                         1 => self.spawn_repeat_task(code).await,
-                        _ => self.cancel_repeat_task().await,
+                        input_event::KEY_PRESSED_NO_REPEAT | input_event::KEY_REPEATED => {
+                            self.cancel_repeat_task().await;
+                            key_event(
+                                self.event_source.clone(),
+                                code,
+                                state,
+                                self.modifier_state.get(),
+                            );
+                        }
+                        _ => {
+                            self.cancel_repeat_task().await;
+                            key_event(
+                                self.event_source.clone(),
+                                code,
+                                0,
+                                self.modifier_state.get(),
+                            );
+                        }
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -527,9 +635,86 @@ impl Emulation for MacOSEmulation {
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        if self.file_drag_owner == Some(handle) {
+            if let Err(error) = self
+                .consume(
+                    Event::Pointer(PointerEvent::Button {
+                        time: 0,
+                        button: BTN_LEFT,
+                        state: 0,
+                    }),
+                    handle,
+                )
+                .await
+            {
+                log::warn!("could not release adopted file drag: {error}");
+            }
+        }
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.cancel_repeat_task().await;
+    }
+
+    /// Place the cursor on `pos` edge at the normalized `cross_axis` offset
+    /// the peer reported, so it appears where it left the other screen.
+    async fn warp_cursor(
+        &mut self,
+        _handle: EmulationHandle,
+        pos: WarpPosition,
+        cross_axis: f32,
+    ) -> Result<(), EmulationError> {
+        if !cross_axis.is_finite() {
+            return Ok(());
+        }
+        let edge = match pos {
+            WarpPosition::Left => Edge::Left,
+            WarpPosition::Right => Edge::Right,
+            WarpPosition::Top => Edge::Top,
+            WarpPosition::Bottom => Edge::Bottom,
+        };
+        let Some((edge_coordinate, cross_coordinate)) =
+            EdgeSegments::from_rectangles(edge, display_rectangles()).denormalize(cross_axis)
+        else {
+            return Ok(());
+        };
+        let (x, y) = match edge {
+            Edge::Left | Edge::Right => (edge_coordinate, cross_coordinate),
+            Edge::Top | Edge::Bottom => (cross_coordinate, edge_coordinate),
+        };
+        let location = CGPoint::new(x as CGFloat, y as CGFloat);
+        // an absolute MouseMoved (like relative motion below) keeps the cursor
+        // and CG's tracking in sync; CGWarpMouseCursorPosition would not.
+        match CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::MouseMoved,
+            location,
+            CGMouseButton::Left,
+        ) {
+            Ok(event) => self.post_pointer_event(&event),
+            Err(_) => log::warn!("cursor warp: mouse event creation failed"),
+        }
+        log::debug!("warped cursor to {edge:?} edge @ ({x}, {y})");
+        Ok(())
+    }
+}
+
+/// Bounds of every active display in global (CGEvent) coordinates.
+fn display_rectangles() -> Vec<Rect> {
+    CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let b = CGDisplay::new(id).bounds();
+            Rect {
+                x: b.origin.x.round() as i32,
+                y: b.origin.y.round() as i32,
+                width: b.size.width.round() as i32,
+                height: b.size.height.round() as i32,
+            }
+        })
+        .collect()
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -538,7 +723,8 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
             scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
             scancode::Linux::KeyCapsLock => XMods::LockMask,
             scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
+            scancode::Linux::KeyLeftAlt => XMods::LeftAlt,
+            scancode::Linux::KeyRightalt => XMods::RightAlt,
             scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
             _ => XMods::empty(),
         };
@@ -548,8 +734,15 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
         }
         let mut mods = modifiers.get();
         match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
+            1 | input_event::KEY_PRESSED_NO_REPEAT => mods.insert(mask),
+            0 => mods.remove(mask),
+            _ => {}
+        }
+        if mask.intersects(XMods::LeftAlt | XMods::RightAlt) {
+            mods.set(
+                XMods::Mod1Mask,
+                mods.intersects(XMods::LeftAlt | XMods::RightAlt),
+            );
         }
         modifiers.set(mods);
         true
@@ -565,7 +758,13 @@ fn set_modifiers(
     locked: u32,
     group: u32,
 ) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
+    let mut depressed = XMods::from_bits(depressed).unwrap_or_default();
+    // Wire modifier snapshots have no left/right information. Preserve the
+    // side learned from key events, but clear it on reset or Option release.
+    depressed.remove(XMods::LeftAlt | XMods::RightAlt);
+    if depressed.contains(XMods::Mod1Mask) {
+        depressed |= active_modifiers.get() & (XMods::LeftAlt | XMods::RightAlt);
+    }
     let _latched = XMods::from_bits(latched).unwrap_or_default();
     let _locked = XMods::from_bits(locked).unwrap_or_default();
     let _group = XMods::from_bits(group).unwrap_or_default();
@@ -587,6 +786,15 @@ fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
     }
     if depressed.contains(XMods::Mod1Mask) {
         flags |= CGEventFlags::CGEventFlagAlternate;
+        // iTerm2's extended keyboard protocol checks these device-specific
+        // flags to recognize Option as Alt. A generic mask alone is not enough.
+        // Use left Option when a backend provides only a modifier snapshot.
+        if depressed.contains(XMods::LeftAlt) || !depressed.contains(XMods::RightAlt) {
+            flags |= CGEventFlags::from_bits_retain(0x20); // NX_DEVICELALTKEYMASK
+        }
+        if depressed.contains(XMods::RightAlt) {
+            flags |= CGEventFlags::from_bits_retain(0x40); // NX_DEVICERALTKEYMASK
+        }
     }
     if depressed.contains(XMods::Mod4Mask) {
         flags |= CGEventFlags::CGEventFlagCommand;
@@ -607,5 +815,86 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+        // Local bookkeeping only; not X11/wire modifier bits.
+        const LeftAlt = (1<<8);
+        const RightAlt = (1<<9);
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    #[test]
+    fn file_drag_adopts_the_held_button_without_requesting_a_click() {
+        let mut pressed = HashSet::new();
+        assert!(!adopt_file_drag(&mut pressed, BTN_LEFT, 1));
+        assert!(pressed.is_empty());
+        assert!(adopt_file_drag(
+            &mut pressed,
+            BTN_LEFT,
+            input_event::BUTTON_ADOPT_FILE_DRAG
+        ));
+        assert!(pressed.contains(&BTN_LEFT));
+        assert!(matches!(
+            drag_event_type(BTN_LEFT),
+            CGEventType::LeftMouseDragged
+        ));
+        assert!(!adopt_file_drag(&mut pressed, BTN_LEFT, 0));
+        assert!(!adopt_file_drag(
+            &mut pressed,
+            BTN_RIGHT,
+            input_event::BUTTON_ADOPT_FILE_DRAG
+        ));
+    }
+
+    #[test]
+    fn option_side_survives_snapshots_and_clears_on_release() {
+        for (key, side) in [
+            (scancode::Linux::KeyLeftAlt, 0x20),
+            (scancode::Linux::KeyRightalt, 0x40),
+        ] {
+            let mods = Cell::new(XMods::empty());
+            update_modifiers(&mods, key as u32, input_event::KEY_PRESSED_NO_REPEAT);
+            set_modifiers(&mods, XMods::Mod1Mask.bits(), 0, 0, 0);
+            assert_eq!(to_cgevent_flags(mods.get()).bits(), 0x80000 | side);
+            update_modifiers(&mods, key as u32, 0);
+            assert!(to_cgevent_flags(mods.get()).is_empty());
+
+            update_modifiers(&mods, key as u32, 1);
+            set_modifiers(&mods, 0, 0, 0, 0);
+            assert!(to_cgevent_flags(mods.get()).is_empty());
+        }
+        assert_eq!(to_cgevent_flags(XMods::Mod1Mask).bits(), 0x80020);
+        let mods = Cell::new(XMods::empty());
+        update_modifiers(&mods, scancode::Linux::KeyLeftAlt as u32, 1);
+        update_modifiers(&mods, scancode::Linux::KeyRightalt as u32, 1);
+        assert_eq!(to_cgevent_flags(mods.get()).bits(), 0x80060);
+        update_modifiers(&mods, scancode::Linux::KeyLeftAlt as u32, 0);
+        assert_eq!(to_cgevent_flags(mods.get()).bits(), 0x80040);
+        update_modifiers(&mods, scancode::Linux::KeyRightalt as u32, 0);
+        assert!(to_cgevent_flags(mods.get()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_before_repeat_task_first_poll_does_not_hang() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let notify = Arc::new(Notify::new());
+                let waiter = notify.clone();
+                let mut task = Some(tokio::task::spawn_local(async move {
+                    waiter.notified().await;
+                }));
+                let result = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    stop_repeat_task(&mut task, &notify),
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "key release lost before repeat task started"
+                );
+            })
+            .await;
     }
 }

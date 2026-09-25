@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     rc::Rc,
 };
@@ -29,11 +29,12 @@ impl ClientManager {
     pub fn add_with_config(&self, config_client: ConfigClient) -> ClientHandle {
         let config = ClientConfig {
             hostname: config_client.hostname,
-            fix_ips: config_client.ips.into_iter().collect(),
+            fix_ips: config_client.ips,
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            key_map: config_client.key_map,
         };
         let state = ClientState {
             active: config_client.active,
@@ -251,6 +252,22 @@ impl ClientManager {
         }
     }
 
+    /// get the key remapping for the corresponding client
+    pub(crate) fn set_key_map(&self, handle: ClientHandle, key_map: HashMap<u32, u32>) {
+        if let Some((config, _)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            config.key_map = key_map;
+        }
+    }
+
+    /// get the key remapping for the corresponding client
+    pub(crate) fn get_key_map(&self, handle: ClientHandle) -> HashMap<u32, u32> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.key_map.clone())
+            .unwrap_or_default()
+    }
+
     /// get the enter hook command
     pub(crate) fn get_enter_cmd(&self, handle: ClientHandle) -> Option<String> {
         self.clients
@@ -304,6 +321,32 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_peer_protocol_capabilities(
+        &self,
+        handle: ClientHandle,
+        enter_with_position: bool,
+        source_key_repeat: bool,
+    ) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.peer_supports_enter_with_position = enter_with_position;
+            state.peer_supports_source_key_repeat = source_key_repeat;
+        }
+    }
+
+    pub(crate) fn supports_enter_with_position(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .is_some_and(|(_, state)| state.peer_supports_enter_with_position)
+    }
+
+    pub(crate) fn supports_source_key_repeat(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .is_some_and(|(_, state)| state.peer_supports_source_key_repeat)
+    }
+
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()
@@ -326,10 +369,50 @@ impl ClientManager {
             .map(|(c, _)| c.port)
     }
 
-    pub(crate) fn get_ips(&self, handle: ClientHandle) -> Option<HashSet<IpAddr>> {
+    pub(crate) fn get_ips(&self, handle: ClientHandle) -> Option<Vec<IpAddr>> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .map(|(_, s)| s.ips.clone())
+            .map(|(config, state)| {
+                let mut seen = HashSet::new();
+                config
+                    .fix_ips
+                    .iter()
+                    .chain(&state.dns_ips)
+                    .copied()
+                    .filter(|ip| seen.insert(*ip))
+                    .collect()
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientManager;
+
+    #[test]
+    fn reconnect_requires_a_new_capability_advertisement() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+
+        clients.set_peer_protocol_capabilities(handle, true, true);
+        assert!(clients.supports_enter_with_position(handle));
+        assert!(clients.supports_source_key_repeat(handle));
+
+        clients.set_peer_protocol_capabilities(handle, false, false);
+        assert!(!clients.supports_enter_with_position(handle));
+        assert!(!clients.supports_source_key_repeat(handle));
+    }
+    #[test]
+    fn addresses_preserve_configured_priority_then_append_unique_dns_results() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let wired = "10.20.20.2".parse().unwrap();
+        let wifi = "192.168.68.57".parse().unwrap();
+        let dns = "192.168.68.58".parse().unwrap();
+        clients.set_fix_ips(handle, vec![wired, wifi, wired]);
+        clients.set_dns_ips(handle, vec![wifi, dns]);
+        assert_eq!(clients.get_ips(handle).unwrap(), vec![wired, wifi, dns]);
+        assert!(clients.get_ips(handle + 1).is_none());
     }
 }

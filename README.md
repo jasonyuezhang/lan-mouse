@@ -312,6 +312,13 @@ the gtk frontend (see conditional compilation).
 </details>
 
 ## Usage
+
+### Native macOS control panel
+
+The [Lan Mouse Control companion](macos-ui/README.md) provides a menu-bar on/off
+switch, live health and network latency, a position arranger, keyboard/mouse
+mappings, an input debugger, and guided pairing/removal for two Macs.
+
 <details>
     <summary>Gtk Frontend</summary>
 
@@ -417,11 +424,24 @@ position = "left"
 # The hostname is optional: When no hostname is specified,
 # at least one ip address needs to be specified.
 hostname = "thorium"
-# ips for ethernet and wifi
+# preferred Ethernet address first, Wi-Fi fallback second
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
 port = 4242
 ```
+
+The first configured IP gets a 250 ms head start when connecting. If it fails
+immediately, fallback addresses start immediately; otherwise, after 250 ms all
+remaining addresses are tried alongside the first. Configured addresses keep
+their order when saved, and DNS addresses are appended after them. Put the
+peer's direct Ethernet address first and its Wi-Fi address second.
+
+If the active link fails, the existing heartbeat detects the failure and the
+next connection attempt uses this preference again. Switching is not seamless:
+you may need to move the pointer back across the screen edge. Plugging Ethernet
+in while Wi-Fi is already connected does not migrate that live connection;
+reconnect to apply the preference. Keep Wi-Fi enabled for internet access when
+using a direct cable, and leave the direct Ethernet interface's gateway blank.
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 

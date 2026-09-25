@@ -21,6 +21,12 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+pub use macos::{begin_native_file_drag, cancel_source_file_drag, set_file_drag_ready};
+
+#[cfg(target_os = "macos")]
+mod key_repeat;
+
 #[cfg(layer_shell)]
 mod layer_shell;
 
@@ -38,7 +44,7 @@ pub type CaptureHandle = u64;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
-    Begin,
+    Begin { cross_axis: Option<f32> },
     /// input event coming from capture handle
     Input(Event),
 }
@@ -46,7 +52,9 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin { cross_axis } => {
+                write!(f, "begin capture ({cross_axis:?})")
+            }
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -211,7 +219,8 @@ impl InputCapture {
             log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
             match state {
                 1 => self.pressed_keys.insert(scancode),
-                _ => self.pressed_keys.remove(&scancode),
+                0 => self.pressed_keys.remove(&scancode),
+                _ => false, // repeats do not change the held-key set
             };
         }
     }

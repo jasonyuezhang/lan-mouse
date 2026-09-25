@@ -1,8 +1,8 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
-use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
-use input_event::Event;
+use futures::{FutureExt, StreamExt};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, WarpPosition};
+use input_event::{Event, PointerEvent};
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -86,6 +86,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            transitions: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -134,6 +135,25 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    transitions: HashMap<SocketAddr, IncomingTransition>,
+}
+
+#[derive(Clone, Copy)]
+enum IncomingTransition {
+    Legacy,
+    Modern { epoch: u64, serial: u32 },
+}
+
+impl IncomingTransition {
+    fn accepts(self, epoch: u64, serial: u32) -> bool {
+        match self {
+            Self::Legacy => true,
+            Self::Modern {
+                epoch: current_epoch,
+                serial: current_serial,
+            } => epoch > current_epoch || (epoch == current_epoch && serial > current_serial),
+        }
+    }
 }
 
 impl ListenTask {
@@ -149,11 +169,39 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
+                                if matches!(self.transitions.get(&addr), Some(IncomingTransition::Modern { .. })) {
+                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    continue;
+                                }
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    self.transitions.insert(addr, IncomingTransition::Legacy);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                }
+                            }
+                            ProtoEvent::EnterWithPosition { pos, cross_axis, epoch, serial } => {
+                                match self.transitions.get(&addr).copied() {
+                                    Some(current) if !current.accepts(epoch, serial) => {
+                                        self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+                                    }
+                                    _ => {
+                                        if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                            log::info!("releasing capture: {addr} entered this device");
+                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            if let Some(cross_axis) = cross_axis {
+                                                self.emulation_proxy.warp_cursor(
+                                                    to_warp_position(pos),
+                                                    cross_axis,
+                                                    addr,
+                                                );
+                                            }
+                                            self.listener.reply(addr, ProtoEvent::Ack(serial)).await;
+                                            self.transitions.insert(addr, IncomingTransition::Modern { epoch, serial });
+                                            self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                        }
+                                    }
                                 }
                             }
                             ProtoEvent::Leave(_) => {
@@ -177,10 +225,14 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
+                            ProtoEvent::Capabilities { .. } => {
+                                self.listener.reply(addr, ProtoEvent::Capabilities { enter_with_position: true, source_key_repeat: cfg!(target_os = "macos") }).await;
+                            }
                             _ => {}
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        self.transitions.remove(&addr);
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
@@ -198,7 +250,10 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr) => {
+                        self.emulation_proxy.remove(addr);
+                        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                    },
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -212,6 +267,7 @@ impl ListenTask {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            self.transitions.remove(&addr);
                             false
                         } else {
                             true
@@ -237,6 +293,7 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    WarpCursor(WarpPosition, f32, SocketAddr),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -255,6 +312,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            pending: None,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -282,6 +340,14 @@ impl EmulationProxy {
         if self.emulation_active.get() {
             self.request_tx
                 .send(ProxyRequest::Input(event, addr))
+                .expect("channel closed");
+        }
+    }
+
+    fn warp_cursor(&self, pos: WarpPosition, cross_axis: f32, addr: SocketAddr) {
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::WarpCursor(pos, cross_axis, addr))
                 .expect("channel closed");
         }
     }
@@ -314,6 +380,8 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    /// request pulled off the channel while coalescing motion, handled next
+    pending: Option<ProxyRequest>,
 }
 
 impl EmulationTask {
@@ -331,6 +399,7 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::WarpCursor(..) => {}
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -352,6 +421,8 @@ impl EmulationTask {
             EmulationEvent::EmulationDisabled,
         );
 
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::receiving(!self.handles.is_empty()).await;
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {
             emulation.terminate().await;
@@ -361,6 +432,8 @@ impl EmulationTask {
         let res = self.do_emulation_session(&mut emulation).await;
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::receiving(false).await;
         res
     }
 
@@ -377,36 +450,108 @@ impl EmulationTask {
         Ok(())
     }
 
+    /// Fold every pointer-motion request already queued behind `first` (from
+    /// the same peer) into one. Over Wi-Fi, packets arrive in bursts; replaying
+    /// each tiny delta individually makes the cursor trail behind the hand,
+    /// while one summed move lands it where it should be right now. Deskflow
+    /// does the same ("compress mouse"). The first non-motion request stops the
+    /// fold and is parked in `pending` so ordering is preserved.
+    fn coalesce_motion(&mut self, first: ProxyRequest) -> ProxyRequest {
+        let ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Motion {
+                time,
+                mut dx,
+                mut dy,
+            }),
+            addr,
+        ) = first
+        else {
+            return first;
+        };
+        while let Some(Some(next)) = self.request_rx.recv().now_or_never() {
+            match next {
+                ProxyRequest::Input(
+                    Event::Pointer(PointerEvent::Motion {
+                        dx: ndx, dy: ndy, ..
+                    }),
+                    naddr,
+                ) if naddr == addr => {
+                    dx += ndx;
+                    dy += ndy;
+                }
+                other => {
+                    self.pending = Some(other);
+                    break;
+                }
+            }
+        }
+        ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }), addr)
+    }
+
     async fn do_emulation_session(
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
         loop {
-            tokio::select! {
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
+            let request = match self.pending.take() {
+                Some(request) => request,
+                None => self.request_rx.recv().await.expect("channel closed"),
+            };
+            match self.coalesce_motion(request) {
+                ProxyRequest::Input(event, addr) => {
+                    let handle = match self.handles.get(&addr) {
+                        Some(&handle) => handle,
+                        None => {
+                            let handle = self.next_id;
+                            self.next_id += 1;
+                            #[cfg(target_os = "macos")]
+                            if self.handles.is_empty() {
+                                crate::mouse_engine::receiving(true).await;
                             }
-                        };
-                        emulation.consume(event, handle).await?;
-                    },
-                    ProxyRequest::Remove(addr) => {
-                        if let Some(handle) = self.handles.remove(&addr) {
-                            emulation.destroy(handle).await;
+                            emulation.create(handle).await;
+                            self.handles.insert(addr, handle);
+                            handle
+                        }
+                    };
+                    emulation.consume(event, handle).await?;
+                }
+                ProxyRequest::WarpCursor(pos, cross_axis, addr) => {
+                    if !self.handles.contains_key(&addr) {
+                        let handle = self.next_id;
+                        self.next_id += 1;
+                        #[cfg(target_os = "macos")]
+                        if self.handles.is_empty() {
+                            crate::mouse_engine::receiving(true).await;
+                        }
+                        emulation.create(handle).await;
+                        self.handles.insert(addr, handle);
+                    }
+                    emulation
+                        .warp_cursor(self.handles[&addr], pos, cross_axis)
+                        .await?;
+                }
+                ProxyRequest::Remove(addr) => {
+                    if let Some(handle) = self.handles.remove(&addr) {
+                        emulation.destroy(handle).await;
+                        #[cfg(target_os = "macos")]
+                        if self.handles.is_empty() {
+                            crate::mouse_engine::receiving(false).await;
                         }
                     }
-                    ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
-                },
+                }
+                ProxyRequest::Terminate => break Ok(()),
+                ProxyRequest::Reenable => continue,
             }
         }
+    }
+}
+
+fn to_warp_position(pos: Position) -> WarpPosition {
+    match pos {
+        Position::Left => WarpPosition::Left,
+        Position::Right => WarpPosition::Right,
+        Position::Top => WarpPosition::Top,
+        Position::Bottom => WarpPosition::Bottom,
     }
 }
 
@@ -424,6 +569,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::WarpCursor(_, _, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
@@ -448,5 +594,139 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IncomingTransition;
+
+    #[test]
+    fn transition_accepts_a_new_serial_after_a_retry() {
+        assert!(
+            IncomingTransition::Modern {
+                epoch: 1,
+                serial: 7
+            }
+            .accepts(1, 8)
+        );
+    }
+
+    #[test]
+    fn transition_rejects_a_duplicate_serial() {
+        assert!(
+            !IncomingTransition::Modern {
+                epoch: 1,
+                serial: 7
+            }
+            .accepts(1, 7)
+        );
+    }
+
+    #[test]
+    fn transition_rejects_a_stale_serial() {
+        assert!(
+            !IncomingTransition::Modern {
+                epoch: 1,
+                serial: 7
+            }
+            .accepts(1, 6)
+        );
+    }
+
+    #[test]
+    fn transition_rejects_packets_from_a_previous_session() {
+        assert!(
+            !IncomingTransition::Modern {
+                epoch: 2,
+                serial: 1
+            }
+            .accepts(1, 99)
+        );
+    }
+
+    #[test]
+    fn transition_accepts_the_first_packet_after_a_reconnect() {
+        assert!(IncomingTransition::Legacy.accepts(1, 1));
+    }
+
+    #[test]
+    fn legacy_transition_accepts_the_first_modern_serial() {
+        assert!(IncomingTransition::Legacy.accepts(1, 1));
+    }
+
+    #[test]
+    fn coalesces_queued_motion_and_parks_the_first_other_request() {
+        use super::{EmulationTask, ProxyRequest};
+        use input_event::{BTN_LEFT, Event, PointerEvent};
+        use local_channel::mpsc::channel;
+        use std::{cell::Cell, rc::Rc};
+
+        let (tx, request_rx) = channel();
+        let (event_tx, _event_rx) = channel();
+        let mut task = EmulationTask {
+            backend: None,
+            exit_requested: Rc::new(Cell::new(false)),
+            request_rx,
+            event_tx,
+            handles: Default::default(),
+            next_id: 0,
+            pending: None,
+        };
+        let a: std::net::SocketAddr = "10.0.0.1:4242".parse().unwrap();
+        let b: std::net::SocketAddr = "10.0.0.2:4242".parse().unwrap();
+        let motion = |dx, dy, addr| {
+            ProxyRequest::Input(
+                Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }),
+                addr,
+            )
+        };
+        let click = ProxyRequest::Input(
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: BTN_LEFT,
+                state: 1,
+            }),
+            a,
+        );
+
+        // queued behind the first motion: two more moves, a click, then another move
+        tx.send(motion(2.0, 0.5, a)).unwrap();
+        tx.send(motion(3.0, -1.0, a)).unwrap();
+        tx.send(click).unwrap();
+        tx.send(motion(100.0, 100.0, a)).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let first = motion(1.0, 1.0, a);
+            let ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. }), addr) =
+                task.coalesce_motion(first)
+            else {
+                panic!("expected motion");
+            };
+            assert_eq!((dx, dy, addr), (6.0, 0.5, a));
+            // the click stopped the fold and is parked, the move after it is untouched
+            assert!(matches!(
+                task.pending.take(),
+                Some(ProxyRequest::Input(Event::Pointer(PointerEvent::Button { .. }), _))
+            ));
+            assert!(matches!(
+                task.request_rx.recv().await,
+                Some(ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { dx, .. }), _)) if dx == 100.0
+            ));
+
+            // motion from a different peer is never merged
+            tx.send(motion(9.0, 9.0, b)).unwrap();
+            let ProxyRequest::Input(Event::Pointer(PointerEvent::Motion { dx, .. }), _) =
+                task.coalesce_motion(motion(1.0, 1.0, a))
+            else {
+                panic!("expected motion");
+            };
+            assert_eq!(dx, 1.0);
+            assert!(matches!(task.pending, Some(ProxyRequest::Input(_, addr)) if addr == b));
+        }));
     }
 }
