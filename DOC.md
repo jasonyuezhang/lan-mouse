@@ -209,6 +209,16 @@ existing Accessibility grant, ending the source drag without forwarding Escape
 to the receiving Mac. The older `StartFileDrag(handle)` request remains accepted
 for older local frontends but does not cancel the source drag.
 
+Chrome tab handoff reuses this flow without protocol changes. The control panel
+detects a Chrome link drag (a `public.url` drag pasteboard) or a pulled-out tab
+(Chrome's focused one-tab window moving without resizing, read via
+Accessibility). It then sends a JSON `{url, profile}` file with the
+`.lanmouse-url` extension. On `CaptureEntered` it activates the transfer and
+sends `CancelNativeFileDrag { pid }` for Chrome instead of `StartFileDragFrom`,
+so no button is adopted remotely. The receiving panel opens `http`/`https` URLs
+from authorized peers only, with `--profile-directory` resolved by profile name
+from Chrome's `Local State`.
+
 The opt-in file channel uses `LMFD\x02` framed datagrams on the existing approved
 DTLS connection; old peers ignore these oversized extension packets. Both peers
 must send matching v2 capability heartbeats before file offers are accepted;

@@ -42,6 +42,29 @@ default. While forwarding, the daemon consumes the shortcut and releases held
 keys before notifying the control panel. A ten-second renewed lease prevents a
 quit/crashed panel from reserving the shortcut indefinitely.
 
+## Drag a Chrome tab to the other Mac
+
+With **Drag files between Macs** on at both Macs, pull a tab out of its Chrome
+window (or drag a one-tab window by its title bar, or drag a link or the address
+bar) toward the paired edge. When the card says Ready, keep going: the page opens
+in Chrome on the other Mac, in the profile with the same name (for example
+"Nash" or "Jason"). Escape is sent to Chrome here, so the dragged tab returns to
+where it was. Only `http`/`https` pages cross, and only from Chrome.
+
+- The profile is read from Chrome's window title, which ends in
+  `Google Chrome - Person (Profile)` once Chrome has several profiles. Reading it,
+  and spotting a pulled-out tab, needs Accessibility access for Lan Mouse Control
+  on the sending Mac (the settings card offers a button).
+- The receiver maps the name to a profile folder through Chrome's `Local State`.
+  If macOS privacy settings block that file, it brings forward an open window of
+  that profile first, since Chrome opens links in its last-active profile.
+  Without such a window the page opens in the last-used profile.
+- Dragging a multi-tab window, resizing a window, and drags inside a window are
+  unaffected.
+
+The page travels as a small `.lanmouse-url` file over the same encrypted
+channel, from a paired Mac only.
+
 ## Drag a file into Slack or Orca on another Mac
 
 Enable **Home → Drag files between Macs** on both Macs and keep both control

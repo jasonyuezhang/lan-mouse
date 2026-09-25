@@ -22,6 +22,18 @@ final class ResolvedTestService: NetService {
             assert(!shouldPrepareFileDrag(position: side, mouse: NSPoint(x: 500, y: 400), previous: away, screen: dragScreen))
         }
         assert(shouldPrepareFileDrag(position: "left", mouse: NSPoint(x: 10, y: 400), previous: nil, screen: dragScreen))
+        assert(chromeProfileName(windowTitle: "Nash - Calendar - Week of September 20, 2026 - Google Chrome - Jason (Nash)") == "Nash")
+        assert(chromeProfileName(windowTitle: "Synced Flow (Piano) - YouTube - Audio playing - Google Chrome - Yue (Jason)") == "Jason")
+        assert(chromeProfileName(windowTitle: "Inbox - Google Chrome - Jason") == "Jason")
+        assert(chromeProfileName(windowTitle: "Who’s using Chrome?") == nil)
+        let localState = Data(#"{"profile":{"info_cache":{"Default":{"name":"Jason"},"Profile 3":{"name":"Nash"}}}}"#.utf8)
+        assert(chromeProfileDirectory(named: "Nash", localState: localState) == "Profile 3")
+        assert(chromeProfileDirectory(named: "Jason", localState: localState) == "Default")
+        assert(chromeProfileDirectory(named: "Work", localState: localState) == nil)
+        assert(ChromeHandoff(url: "https://github.com/feschber/lan-mouse", profile: "Nash").webURL != nil)
+        for url in ["file:///etc/passwd", "javascript:alert(1)", "chrome://settings", "https://", "not a url"] {
+            assert(ChromeHandoff(url: url, profile: nil).webURL == nil)
+        }
         let shortcutSuite = "lan-mouse-shortcut-tests-" + UUID().uuidString
         let shortcutPrefs = UserDefaults(suiteName: shortcutSuite)!
         defer { shortcutPrefs.removePersistentDomain(forName: shortcutSuite) }

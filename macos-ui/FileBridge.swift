@@ -38,6 +38,10 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
     private var timer: Timer?
     private var boardChange = NSPasteboard(name: .drag).changeCount
     private var armed: (url: URL, pid: pid_t)?
+    /// Set when `armed` is a Chrome page rather than a file.
+    private var chrome: ChromeHandoff?
+    /// Chrome's focused window when the current press was first seen; nil window once ruled out.
+    private var chromePress: (window: AXUIElement?, position: CGPoint, size: CGSize)?
     private var previousDragPoint: NSPoint?
     private var job: FileBridgeJob?
     private var peerID: Int?
@@ -54,6 +58,7 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
         guard timer == nil else { return }
         self.model = model
         enabled = FileManager.default.fileExists(atPath: fileBridgeRoot.appendingPathComponent("enabled").path)
+        try? FileManager.default.removeItem(at: fileBridgeRoot.appendingPathComponent("outgoing-pages"))
         connectionChanged()
         // Old transfers remain readable by agents, but are never replayed after restart.
         seen = Set((try? FileManager.default.contentsOfDirectory(atPath: fileBridgeRoot.appendingPathComponent("received").path)) ?? [])
@@ -91,7 +96,8 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
     private func cancel() {
         if let job, !crossed { try? FileManager.default.removeItem(at: jobURL(job.id)) }
         model?.send(["SetFileDragReady": false], record: false)
-        job = nil; peerID = nil; armed = nil; previousDragPoint = nil; ready = false; crossed = false
+        if chrome != nil, let armed { try? FileManager.default.removeItem(at: armed.url.deletingLastPathComponent()) }
+        job = nil; peerID = nil; armed = nil; chrome = nil; previousDragPoint = nil; ready = false; crossed = false
         hideHUD()
     }
     private func tick() {
@@ -111,8 +117,15 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
                 // The daemon validates and reads the selected file near the edge.
                 // Probing it here would require a second app's folder permission.
                 armed = (url, NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0)
+            } else if held, !crossed, let chromeApp = frontmostChrome(),
+                      let link = board.string(forType: .URL), ChromeHandoff(url: link, profile: nil).webURL != nil {
+                // A link or address-bar drag out of Chrome.
+                cancel()
+                armChrome(ChromeHandoff(url: link, profile: ChromeWindow.focused(pid: chromeApp.processIdentifier).flatMap { chromeProfileName(windowTitle: $0.title) }), pid: chromeApp.processIdentifier)
             }
         }
+        if !held { chromePress = nil }
+        if held, !crossed, armed == nil, let chromeApp = frontmostChrome() { detectChromeTabDrag(pid: chromeApp.processIdentifier) }
         if !held && !crossed { if armed != nil { cancel() }; return }
         guard let armed else { return }
         if job == nil, let model {
@@ -125,7 +138,7 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
             model.send(["PrepareFileDrag": peer.id], record: false)
             peerID = peer.id
             job = FileBridgeJob(id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(), peer: fingerprint, source: armed.url.path, created: Date().timeIntervalSince1970)
-            do { try saveJob(); status = "Preparing \(armed.url.lastPathComponent)…"; showHUD(file: armed.url.lastPathComponent, position: peer.position) }
+            do { try saveJob(); status = "Preparing \(armedName)…"; showHUD(file: armedName, position: peer.position) }
             catch { status = "Couldn’t prepare the file: \(error.localizedDescription)"; cancel() }
         }
         guard let job else { return }
@@ -139,19 +152,58 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
         if let data = try? Data(contentsOf: stateURL), let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let phase = state["state"] as? String {
             if phase == "ready" && !crossed {
                 if !ready { model?.send(["SetFileDragReady": true], record: false) }
-                ready = true; status = "Ready — continue across and drop into your app."; showHUD(file: armed.url.lastPathComponent, isReady: true)
+                ready = true; status = "Ready — continue across and drop into your app."; showHUD(file: armedName, isReady: true)
             } else if phase == "sending" && !crossed {
                 let percent = Int((state["progress"] as? Double ?? 0) * 100)
-                status = "Copying \(armed.url.lastPathComponent) · \(percent)%"; showHUD(file: armed.url.lastPathComponent, progress: Double(percent) / 100)
+                status = "Copying \(armedName) · \(percent)%"; showHUD(file: armedName, progress: Double(percent) / 100)
             } else if phase.hasPrefix("error:") { status = String(phase.dropFirst(7)); cancel(); return }
-            else if phase == "activated" { status = "File handed to the other Mac. Drop it into your app."; cancel(); return }
+            else if phase == "activated" { status = chrome == nil ? "File handed to the other Mac. Drop it into your app." : "Opened \(armedName) on the other Mac."; cancel(); return }
         }
         if ready && !crossed && scans % 4 == 0 { model?.send(["SetFileDragReady": true], record: false) }
+    }
+    private func frontmostChrome() -> NSRunningApplication? {
+        let app = NSWorkspace.shared.frontmostApplication
+        return app?.bundleIdentifier == chromeBundleID ? app : nil
+    }
+    /// A tab pulled out of Chrome becomes a one-tab window that follows the pointer.
+    /// Dragging a one-tab window by its title bar counts too; resizing does not.
+    private func detectChromeTabDrag(pid: pid_t) {
+        guard AXIsProcessTrusted(), let window = ChromeWindow.focused(pid: pid) else { return }
+        let size = window.size
+        guard let press = chromePress, let pressed = press.window, CFEqual(pressed, window.element) else {
+            chromePress = (window.element, window.position, size); return
+        }
+        guard hypot(window.position.x - press.position.x, window.position.y - press.position.y) > 3, size == press.size else { return }
+        chromePress = (nil, window.position, size) // decide once per press
+        guard window.tabCount == 1, let url = window.document else { return }
+        armChrome(ChromeHandoff(url: url, profile: chromeProfileName(windowTitle: window.title)), pid: pid)
+    }
+    private func armChrome(_ handoff: ChromeHandoff, pid: pid_t) {
+        guard let page = handoff.webURL else { return }
+        let dir = fileBridgeRoot.appendingPathComponent("outgoing-pages/\(UUID().uuidString)", isDirectory: true)
+        let file = dir.appendingPathComponent("\(page.host ?? "page").\(chromeHandoffExtension)")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONEncoder().encode(handoff).write(to: file, options: .atomic)
+            armed = (file, pid); chrome = handoff
+        } catch { status = "Couldn’t prepare the Chrome page: \(error.localizedDescription)" }
+    }
+    private var armedName: String {
+        guard let armed else { return "" }
+        guard let chrome else { return armed.url.lastPathComponent }
+        return (chrome.webURL?.host ?? "Chrome page") + (chrome.profile.map { " · \($0)" } ?? "")
     }
     func captured(handle: Int) {
         relay?.cancel()
         guard enabled, ready, !crossed, peerID == handle, NSEvent.pressedMouseButtons & 1 != 0, let armed, job != nil else { return }
         crossed = true; ready = false; job?.activate = true
+        if chrome != nil {
+            // The page opens over there; Escape puts the dragged tab back where it was.
+            model?.send(["CancelNativeFileDrag": ["pid": armed.pid]], record: false)
+            do { try saveJob() } catch { status = error.localizedDescription }
+            model?.send(["SetFileDragReady": false], record: false)
+            hideHUD(); return
+        }
         // A file drag began before capture, so the receiver has not seen its mouse-down.
         model?.send(["StartFileDragFrom": ["handle": handle, "source_pid": armed.pid]], record: false)
         do { try saveJob() } catch { status = error.localizedDescription }
@@ -183,6 +235,13 @@ func shouldPrepareFileDrag(position: String, mouse: NSPoint, previous: NSPoint?,
                   FileManager.default.fileExists(atPath: url.path) else {
                 status = "Couldn’t locate the received file."
                 NSLog("File bridge: rejected received file location %@", id)
+                continue
+            }
+            if url.pathExtension == chromeHandoffExtension {
+                if let data = try? Data(contentsOf: url), data.count < 16_384, let handoff = try? JSONDecoder().decode(ChromeHandoff.self, from: data) {
+                    status = openChromeHandoff(handoff)
+                } else { status = "Couldn’t read the Chrome page from the other Mac." }
+                try? Data("copied".utf8).write(to: dir.appendingPathComponent("handoff"), options: .atomic)
                 continue
             }
             status = "Drop \(url.lastPathComponent) into your app."
@@ -409,6 +468,14 @@ struct FileBridgeSettings: View {
                 Toggle("Drag files between Macs", isOn: Binding(get: { bridge.enabled }, set: bridge.setEnabled))
                 Text(bridge.status).font(.caption).foregroundStyle(.secondary)
                 if bridge.enabled { Text("Hold one file at the shared screen edge until Ready, then drop into Slack’s message field, Orca’s chat, or another file drop area. Up to 64 MB; copies stay on the receiving Mac. You send chat messages yourself.").font(.caption).foregroundStyle(.secondary) }
+                if bridge.enabled {
+                    Text("Chrome: drag a tab out of its window (or drag a link) to the edge until Ready, then keep going. It opens in Chrome on the other Mac, in the profile with the same name; the tab stays here.").font(.caption).foregroundStyle(.secondary)
+                    if !AXIsProcessTrusted() {
+                        Button("Allow Accessibility to hand off Chrome tabs…") {
+                            _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+                        }.font(.caption)
+                    }
+                }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
         }
     }

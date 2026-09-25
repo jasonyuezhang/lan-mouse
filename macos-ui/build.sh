@@ -9,7 +9,7 @@ if [ -z "$app_signing_identity" ] && [ -d "$out" ]; then
 fi
 app_signing_identity="${app_signing_identity:-${LAN_MOUSE_ENGINE_SIGN_IDENTITY:--}}"
 mkdir -p "$out/Contents/MacOS" "$out/Contents/Resources"
-xcrun swiftc -swift-version 5 -O -parse-as-library -target arm64-apple-macosx14.0 ControlModel.swift Discovery.swift Pairing.swift MouseProfile.swift SharingShortcut.swift FileBridge.swift MousePanel.swift LanMouseControl.swift -o "$out/Contents/MacOS/LanMouseControl"
+xcrun swiftc -swift-version 5 -O -parse-as-library -target arm64-apple-macosx14.0 ControlModel.swift Discovery.swift Pairing.swift MouseProfile.swift SharingShortcut.swift ChromeHandoff.swift FileBridge.swift MousePanel.swift LanMouseControl.swift -o "$out/Contents/MacOS/LanMouseControl"
 daemon="../.lan-mouse-target/release/lan-mouse"
 [ -x "$daemon" ] || daemon="../../.lan-mouse-target/release/lan-mouse"
 [ -x "$daemon" ] || { echo "Build the daemon with cargo build --release --no-default-features first" >&2; exit 1; }
