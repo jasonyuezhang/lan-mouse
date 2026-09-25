@@ -9,7 +9,7 @@ use std::{
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -42,6 +42,9 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+// Give a configured wired address priority without waiting for its full DTLS
+// timeout when the cable is unplugged. Fallback paths race after this delay.
+const PREFERRED_ADDRESS_GRACE: Duration = Duration::from_millis(250);
 
 async fn connect(
     addr: SocketAddr,
@@ -75,8 +78,20 @@ async fn connect_any(
     addrs: &[SocketAddr],
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
+    let Some((&preferred, fallbacks)) = addrs.split_first() else {
+        return Err(LanMouseConnectionError::NotConnected);
+    };
     let mut joinset = JoinSet::new();
-    for &addr in addrs {
+    joinset.spawn_local(connect(preferred, cert.clone()));
+    tokio::select! {
+        biased;
+        result = joinset.join_next() => match result.expect("preferred attempt").expect("join error") {
+            Ok(conn) => return Ok(conn),
+            Err((addr, error)) => log::warn!("failed to connect to {addr}: `{error}`"),
+        },
+        _ = tokio::time::sleep(PREFERRED_ADDRESS_GRACE) => {},
+    }
+    for &addr in fallbacks {
         joinset.spawn_local(connect(addr, cert.clone()));
     }
     loop {
@@ -95,6 +110,7 @@ async fn connect_any(
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
@@ -103,11 +119,16 @@ pub(crate) struct LanMouseConnection {
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
             client_manager,
+            authorized_keys,
             conns: Default::default(),
             connecting: Default::default(),
             recv_rx,
@@ -129,6 +150,12 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        let Some(event) = keyboard_event_for_peer(
+            event,
+            self.client_manager.supports_source_key_repeat(handle),
+        ) else {
+            return Ok(());
+        };
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
@@ -165,12 +192,15 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                self.authorized_keys.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
     }
 }
 
+// Each connection task owns clones of its I/O and authorization state.
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
     cert: Certificate,
@@ -179,9 +209,10 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
-    client_manager.set_peer_protocol_capabilities(handle, false);
+    client_manager.set_peer_protocol_capabilities(handle, false, false);
     // sending did not work, figure out active conn.
     if let Some(addrs) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
@@ -217,6 +248,7 @@ async fn connect_to_handle(
         }
         let (buf, len) = ProtoEvent::Capabilities {
             enter_with_position: true,
+            source_key_repeat: cfg!(target_os = "macos"),
         }
         .into();
         if let Err(e) = conn.send(&buf[..len]).await {
@@ -224,13 +256,7 @@ async fn connect_to_handle(
         }
 
         // poll connection for active
-        spawn_local(ping_pong(
-            addr,
-            conn.clone(),
-            ping_response.clone(),
-            client_manager.clone(),
-            handle,
-        ));
+        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
 
         // receiver
         spawn_local(receive_loop(
@@ -241,6 +267,7 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            authorized_keys,
         ));
         return Ok(());
     }
@@ -252,13 +279,13 @@ async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-    client_manager: ClientManager,
-    handle: ClientHandle,
 ) {
     loop {
-        if !client_manager.supports_enter_with_position(handle) {
+        // Retry negotiation even when a previous capability reply was lost.
+        {
             let (buf, len) = ProtoEvent::Capabilities {
                 enter_with_position: true,
+                source_key_repeat: cfg!(target_os = "macos"),
             }
             .into();
             if let Err(e) = conn.send(&buf[..len]).await {
@@ -289,6 +316,7 @@ async fn ping_pong(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop(
     client_manager: ClientManager,
     handle: ClientHandle,
@@ -297,9 +325,47 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
+    #[cfg(target_os = "macos")]
+    let (profiles, files) = {
+        let dtls = conn
+            .as_any()
+            .downcast_ref::<DTLSConn>()
+            .expect("DTLS connection");
+        let certificates = dtls.connection_state().await.peer_certificates;
+        let fingerprint = certificates
+            .first()
+            .map(|c| crate::crypto::generate_fingerprint(c))
+            .unwrap_or_default();
+        (
+            crate::mouse_profile::session(
+                conn.clone(),
+                authorized_keys.clone(),
+                fingerprint.clone(),
+            ),
+            crate::file_bridge::session(conn.clone(), authorized_keys, fingerprint, true),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = authorized_keys;
+    let mut received = [0u8; 1024];
+    while let Ok(size) = conn.recv(&mut received).await {
+        #[cfg(target_os = "macos")]
+        if received[..size].starts_with(crate::mouse_profile::MAGIC) {
+            let _ = profiles.try_send(received[..size].to_vec());
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        if received[..size].starts_with(crate::file_bridge::MAGIC) {
+            let _ = files.try_send(received[..size].to_vec());
+            continue;
+        }
+        if size == 0 || size > MAX_EVENT_SIZE {
+            continue;
+        }
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[..size].copy_from_slice(&received[..size]);
         match buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
@@ -317,8 +383,13 @@ async fn receive_loop(
                     }
                     ProtoEvent::Capabilities {
                         enter_with_position,
+                        source_key_repeat,
                     } => {
-                        client_manager.set_peer_protocol_capabilities(handle, enter_with_position);
+                        client_manager.set_peer_protocol_capabilities(
+                            handle,
+                            enter_with_position,
+                            source_key_repeat,
+                        );
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }
@@ -344,7 +415,138 @@ async fn disconnect(
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
-    client_manager.set_peer_protocol_capabilities(handle, false);
+    client_manager.set_peer_protocol_capabilities(handle, false, false);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+}
+
+/// Only macOS capture currently produces source-timed repeats. Other backends
+/// and older receivers retain the existing press/release behavior.
+fn keyboard_event_for_peer(mut event: ProtoEvent, source_repeat: bool) -> Option<ProtoEvent> {
+    if cfg!(target_os = "macos") {
+        if let ProtoEvent::Input(input_event::Event::Keyboard(input_event::KeyboardEvent::Key {
+            state,
+            ..
+        })) = &mut event
+        {
+            *state = match (*state, source_repeat) {
+                (1, true) => input_event::KEY_PRESSED_NO_REPEAT,
+                (input_event::KEY_REPEATED, false) => return None,
+                (state, _) => state,
+            };
+        }
+    }
+    Some(event)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod repeat_tests {
+    use super::*;
+    use input_event::{Event, KEY_PRESSED_NO_REPEAT, KEY_REPEATED, KeyboardEvent};
+
+    fn key(state: u8) -> ProtoEvent {
+        ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 42,
+            key: 30,
+            state,
+        }))
+    }
+    fn state(event: Option<ProtoEvent>) -> Option<u8> {
+        match event {
+            Some(ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key { state, .. }))) => {
+                Some(state)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn old_peers_get_legacy_presses_and_no_source_repeats() {
+        assert_eq!(state(keyboard_event_for_peer(key(1), false)), Some(1));
+        assert_eq!(
+            state(keyboard_event_for_peer(key(KEY_REPEATED), false)),
+            None
+        );
+        assert_eq!(state(keyboard_event_for_peer(key(0), false)), Some(0));
+    }
+
+    #[test]
+    fn new_peers_get_explicit_presses_repeats_and_releases() {
+        assert_eq!(
+            state(keyboard_event_for_peer(key(1), true)),
+            Some(KEY_PRESSED_NO_REPEAT)
+        );
+        assert_eq!(
+            state(keyboard_event_for_peer(key(KEY_REPEATED), true)),
+            Some(KEY_REPEATED)
+        );
+        assert_eq!(state(keyboard_event_for_peer(key(0), true)), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod address_preference_tests {
+    use super::*;
+    use webrtc_util::conn::Listener;
+
+    async fn check_preference(preferred_available: bool) {
+        let cert = Certificate::generate_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let listener = webrtc_dtls::listener::listen(
+            "127.0.0.1:0",
+            Config {
+                certificates: vec![cert.clone()],
+                extended_master_secret: ExtendedMasterSecretType::Require,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let live_addr = listener.addr().await.unwrap();
+        // A bound socket that never responds models a disconnected cable.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let addresses = if preferred_available {
+            [live_addr, silent_addr]
+        } else {
+            [silent_addr, live_addr]
+        };
+        let (outbound, inbound) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(connect_any(&addresses, cert), listener.accept())
+        })
+        .await
+        .expect("Wi-Fi fallback must not wait for the five-second connection timeout");
+        let (outbound, chosen) = outbound.unwrap();
+        let (inbound, _) = inbound.unwrap();
+        assert_eq!(chosen, live_addr);
+        let mut packet = [0; 2048];
+        if preferred_available {
+            assert_eq!(
+                silent.try_recv(&mut packet).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "fallback must not be attempted when the preferred address connects promptly"
+            );
+        } else {
+            assert!(
+                silent.try_recv(&mut packet).is_ok(),
+                "preferred address must be tried first"
+            );
+        }
+        outbound.close().await.unwrap();
+        inbound.close().await.unwrap();
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_preferred_address_is_used_before_fallback() {
+        tokio::task::LocalSet::new()
+            .run_until(check_preference(true))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_preferred_address_falls_back_without_full_timeout() {
+        tokio::task::LocalSet::new()
+            .run_until(check_preference(false))
+            .await;
+    }
 }

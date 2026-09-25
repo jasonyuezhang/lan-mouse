@@ -1748,12 +1748,14 @@ dependencies = [
 name = "lan-mouse"
 version = "0.11.0"
 dependencies = [
+ "cc",
  "clap",
  "env_logger",
  "futures",
  "input-capture",
  "input-emulation",
  "input-event",
+ "keycode",
  "lan-mouse-cli",
  "lan-mouse-gtk",
  "lan-mouse-ipc",
@@ -1762,6 +1764,7 @@ dependencies = [
  "local-channel",
  "log",
  "notify",
+ "plist",
  "rcgen",
  "rustls",
  "serde",
@@ -1818,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "input-event",
  "num_enum",
@@ -2284,6 +2287,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "plist"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
+dependencies = [
+ "base64",
+ "indexmap",
+ "quick-xml 0.41.0",
+ "serde",
+ "time",
+]
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2376,6 +2392,15 @@ name = "quick-xml"
 version = "0.39.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.41.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]
@@ -3434,7 +3459,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
 dependencies = [
  "proc-macro2",
- "quick-xml",
+ "quick-xml 0.39.2",
  "quote",
 ]
 

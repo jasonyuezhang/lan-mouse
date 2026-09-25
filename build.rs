@@ -1,6 +1,15 @@
 use shadow_rs::ShadowBuilder;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        cc::Build::new()
+            .file("src/mouse_engine.m")
+            .flag("-fobjc-arc")
+            .compile("mouse_engine");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rerun-if-changed=src/mouse_engine.m");
+    }
     ShadowBuilder::builder()
         .deny_const(Default::default())
         .build()

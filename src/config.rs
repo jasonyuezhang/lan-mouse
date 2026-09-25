@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::env::{self, VarError};
 use std::fmt::Display;
 use std::fs::{self, File};
+use std::io;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, io};
 use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
@@ -311,7 +311,7 @@ pub struct Config {
 }
 
 pub struct ConfigClient {
-    pub ips: HashSet<IpAddr>,
+    pub ips: Vec<IpAddr>,
     pub hostname: Option<String>,
     pub port: u16,
     pub pos: Position,
@@ -341,7 +341,7 @@ impl From<TomlClient> for ConfigClient {
             )
             .collect();
         let hostname = toml.hostname;
-        let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
+        let ips = toml.ips.unwrap_or_default();
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
         Self {
@@ -381,9 +381,7 @@ impl From<ConfigClient> for TomlClient {
         let key_map = (!key_map.is_empty()).then_some(key_map);
         let button_map = (!button_map.is_empty()).then_some(button_map);
         let host_name = None;
-        let mut ips = client.ips.into_iter().collect::<Vec<_>>();
-        ips.sort();
-        let ips = Some(ips);
+        let ips = Some(client.ips);
         let port = if client.port == DEFAULT_PORT {
             None
         } else {
@@ -581,9 +579,6 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
@@ -670,6 +665,41 @@ mod tests {
     use scancode::Linux::*;
 
     #[test]
+    fn removing_last_client_persists_without_removing_trust() {
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-remove-last-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let (_, watch_rx) = tokio::sync::mpsc::channel(1);
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: dir.join("identity.pem"),
+            config_path: dir.join("config.toml"),
+            config_dir: dir.clone(),
+            config_toml: Some(toml::from_str(
+                "[[clients]]\nhostname = \"other.local\"\n[authorized_fingerprints]\ntrusted = \"Other Mac\""
+            ).unwrap()),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx,
+        };
+        config.set_clients(vec![]);
+        config.write_back().unwrap();
+        let saved = ConfigToml::new(&config.config_path).unwrap();
+        assert!(saved.clients.unwrap().is_empty());
+        assert_eq!(
+            saved.authorized_fingerprints.unwrap()["trusted"],
+            "Other Mac"
+        );
+        drop(config);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn key_map_round_trips_through_toml_with_readable_names() {
         let toml_src = r#"
 [[clients]]
@@ -699,5 +729,18 @@ button_map = { Middle = "Back", Left = "Right" }
         let back: TomlClient = ConfigClient::from(plain.clients.unwrap().remove(0)).into();
         assert!(back.key_map.is_none());
         assert!(back.button_map.is_none());
+    }
+    #[test]
+    fn configured_ip_priority_survives_round_trip() {
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+[[clients]]
+ips = ["192.168.68.57", "10.20.20.2"]
+"#,
+        )
+        .unwrap();
+        let original = parsed.clients.unwrap().remove(0);
+        let saved: TomlClient = ConfigClient::from(original.clone()).into();
+        assert_eq!(saved.ips, original.ips);
     }
 }

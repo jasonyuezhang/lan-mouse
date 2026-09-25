@@ -41,6 +41,7 @@ pub(crate) enum ICaptureEvent {
     /// The capture was released while this client was active:
     /// the cursor is back on this device.
     ClientLeft(u64),
+    SharingShortcutPressed(lan_mouse_ipc::SharingShortcut),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +66,9 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    SetSharingShortcut(Option<lan_mouse_ipc::SharingShortcut>),
+    StartFileDrag(CaptureHandle, Option<i32>),
+    PrepareFileDrag(CaptureHandle),
 }
 
 impl Capture {
@@ -77,6 +81,9 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
+            file_drag_button: false,
+            file_drag_released: false,
+            sharing_shortcut: None,
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -148,6 +155,24 @@ impl Capture {
         self.event_rx.recv().now_or_never().flatten()
     }
 
+    pub(crate) fn prepare_file_drag(&self, handle: CaptureHandle) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::PrepareFileDrag(handle));
+    }
+
+    pub(crate) fn start_file_drag(&self, handle: CaptureHandle, source_pid: Option<i32>) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::StartFileDrag(handle, source_pid));
+    }
+
+    pub(crate) fn set_sharing_shortcut(&self, shortcut: Option<lan_mouse_ipc::SharingShortcut>) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetSharingShortcut(shortcut));
+    }
+
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
@@ -174,6 +199,9 @@ macro_rules! debounce {
 pub(crate) type KeyMap = HashMap<u32, u32>;
 
 struct CaptureTask {
+    file_drag_button: bool,
+    file_drag_released: bool,
+    sharing_shortcut: Option<crate::sharing_shortcut::CaptureShortcut>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
@@ -291,11 +319,16 @@ impl CaptureTask {
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
+                        CaptureRequest::PrepareFileDrag(handle) => { let _ = self.conn.send(ProtoEvent::Ping, handle).await; },
+                        CaptureRequest::StartFileDrag(_, _) => {},
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t, m) => self.add_capture(h, p, t, m),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
+                        CaptureRequest::SetSharingShortcut(shortcut) => {
+                        self.sharing_shortcut = shortcut.and_then(crate::sharing_shortcut::CaptureShortcut::new);
+                    }
+                    CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                     },
@@ -377,7 +410,9 @@ impl CaptureTask {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(serial) if self.state.acknowledges(serial) => {
                             log::info!("client {handle} acknowledged the connection!");
+                            let was_waiting = !matches!(self.state, State::Sending);
                             self.state = State::Sending;
+                            if was_waiting && self.file_drag_button { self.send_file_drag_button(handle, 1).await; }
                             self.ack_deadline = None;
                         }
                         // client disconnected
@@ -407,6 +442,17 @@ impl CaptureTask {
                     self.release_capture(capture).await?;
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
+                    CaptureRequest::PrepareFileDrag(handle) => { let _ = self.conn.send(ProtoEvent::Ping, handle).await; },
+                    CaptureRequest::StartFileDrag(handle, source_pid) => {
+                        if self.active_client == Some(handle) && !self.file_drag_button && !self.file_drag_released {
+                            self.file_drag_button = true;
+                            if matches!(self.state, State::Sending) { self.send_file_drag_button(handle, 1).await; }
+                            #[cfg(target_os = "macos")]
+                            if let Some(pid) = source_pid { input_capture::cancel_source_file_drag(pid); }
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = source_pid;
+                        }
+                    },
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t, m) => {
@@ -420,6 +466,9 @@ impl CaptureTask {
                         }
                         self.remove_capture(h);
                         capture.destroy(h).await?;
+                    }
+                    CaptureRequest::SetSharingShortcut(shortcut) => {
+                        self.sharing_shortcut = shortcut.and_then(crate::sharing_shortcut::CaptureShortcut::new);
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -437,6 +486,20 @@ impl CaptureTask {
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
+        if matches!(event, CaptureEvent::Begin { .. }) {
+            self.file_drag_released = false;
+        }
+        if matches!(
+            event,
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
+                button: input_event::BTN_LEFT,
+                state: 0,
+                ..
+            }))
+        ) {
+            self.file_drag_button = false;
+            self.file_drag_released = true;
+        }
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -475,8 +538,31 @@ impl CaptureTask {
             }
         }
 
+        let sharing_shortcut = match event {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) => self
+                .sharing_shortcut
+                .as_ref()
+                .filter(|shortcut| {
+                    shortcut.matches(key, state, Instant::now(), |key| {
+                        capture.keys_pressed(&[key])
+                    })
+                })
+                .map(|shortcut| shortcut.shortcut),
+            _ => None,
+        };
+        if let Some(shortcut) = sharing_shortcut {
+            // Release forwarded modifiers before returning control to the local UI.
+            self.release_capture(capture).await?;
+            self.event_tx
+                .send(ICaptureEvent::SharingShortcutPressed(shortcut))
+                .expect("channel closed");
+            return Ok(());
+        }
+
         // activated a new client
         if matches!(event, CaptureEvent::Begin { .. }) && Some(handle) != self.active_client {
+            #[cfg(target_os = "macos")]
+            crate::mouse_engine::sending(true).await;
             self.active_client.replace(handle);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
@@ -526,10 +612,29 @@ impl CaptureTask {
         Ok(())
     }
 
+    async fn send_file_drag_button(&self, handle: CaptureHandle, state: u32) {
+        let event = ProtoEvent::Input(Event::Pointer(PointerEvent::Button {
+            time: 0,
+            button: input_event::BTN_LEFT,
+            state: if state == 1 {
+                input_event::BUTTON_ADOPT_FILE_DRAG
+            } else {
+                state
+            },
+        }));
+        if let Err(e) = self.conn.send(event, handle).await {
+            log::warn!("file-drag button: {e}");
+        }
+    }
+
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         self.ack_deadline = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            if self.file_drag_button {
+                self.send_file_drag_button(handle, 0).await;
+            }
+            self.file_drag_button = false;
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -576,7 +681,10 @@ impl CaptureTask {
                 .send(ICaptureEvent::ClientLeft(handle))
                 .expect("channel closed");
         }
-        capture.release().await
+        let result = capture.release().await;
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::sending(false).await;
+        result
     }
 }
 

@@ -1,5 +1,16 @@
 use std::fmt::{self, Display};
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+/// Key state for a repeat generated at the capture source.
+pub const KEY_REPEATED: u8 = 2;
+/// Key down that must not start a receiver-side repeat timer.
+pub const KEY_PRESSED_NO_REPEAT: u8 = 3;
+/// Adopt an already-held left button for a native file drag, without clicking
+/// the receiving desktop. Used only after file-bridge v2 negotiation.
+pub const BUTTON_ADOPT_FILE_DRAG: u32 = 2;
+
 pub mod error;
 pub mod scancode;
 pub mod screen;
@@ -28,7 +39,8 @@ pub enum PointerEvent {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum KeyboardEvent {
-    /// a key press / release event
+    /// A key event: 0 = release, 1 = press with local repeat,
+    /// 2 = source repeat, 3 = press without local repeat.
     Key { time: u32, key: u32, state: u8 },
     /// modifiers changed state
     Modifiers {

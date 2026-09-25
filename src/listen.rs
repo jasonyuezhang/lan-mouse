@@ -115,6 +115,7 @@ impl LanMouseListener {
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
 
+        let profile_trust = authorized_keys.clone();
         let conns_clone = conns.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
@@ -135,7 +136,7 @@ impl LanMouseListener {
                                 let cert = certs.first().expect("cert");
                                 let fingerprint = crypto::generate_fingerprint(cert);
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
+                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), profile_trust.clone()));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -250,10 +251,47 @@ async fn read_loop(
     addr: SocketAddr,
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
+    authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(), Error> {
-    let mut b = [0u8; MAX_EVENT_SIZE];
-
-    while conn.recv(&mut b).await.is_ok() {
+    #[cfg(target_os = "macos")]
+    let (profiles, files) = {
+        let dtls = conn
+            .as_any()
+            .downcast_ref::<DTLSConn>()
+            .expect("DTLS connection");
+        let certificates = dtls.connection_state().await.peer_certificates;
+        let fingerprint = certificates
+            .first()
+            .map(|c| crate::crypto::generate_fingerprint(c))
+            .unwrap_or_default();
+        (
+            crate::mouse_profile::session(
+                conn.clone(),
+                authorized_keys.clone(),
+                fingerprint.clone(),
+            ),
+            crate::file_bridge::session(conn.clone(), authorized_keys, fingerprint, false),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let _ = authorized_keys;
+    let mut received = [0u8; 1024];
+    while let Ok(size) = conn.recv(&mut received).await {
+        #[cfg(target_os = "macos")]
+        if received[..size].starts_with(crate::mouse_profile::MAGIC) {
+            let _ = profiles.try_send(received[..size].to_vec());
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        if received[..size].starts_with(crate::file_bridge::MAGIC) {
+            let _ = files.try_send(received[..size].to_vec());
+            continue;
+        }
+        if size == 0 || size > MAX_EVENT_SIZE {
+            continue;
+        }
+        let mut b = [0u8; MAX_EVENT_SIZE];
+        b[..size].copy_from_slice(&received[..size]);
         match b.try_into() {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })

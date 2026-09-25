@@ -73,11 +73,11 @@ pub enum ProtoEvent {
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
-    Hello {
-        commit: [u8; 8],
-    },
+    Hello { commit: [u8; 8] },
     Capabilities {
         enter_with_position: bool,
+        /// Receiver accepts source-timed keyboard states 2 and 3.
+        source_key_repeat: bool,
     },
     /// Atomically enter a peer and place the cursor on its corresponding
     /// physical edge. `serial` makes retries idempotent and rejects stale
@@ -111,8 +111,12 @@ impl Display for ProtoEvent {
             }
             ProtoEvent::Capabilities {
                 enter_with_position,
+                source_key_repeat,
             } => {
-                write!(f, "Capabilities({enter_with_position})")
+                write!(
+                    f,
+                    "Capabilities({enter_with_position}, {source_key_repeat})"
+                )
             }
             ProtoEvent::EnterWithPosition {
                 pos,
@@ -232,9 +236,13 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
-            EventType::Capabilities => Ok(Self::Capabilities {
-                enter_with_position: decode_u8(&mut buf)? != 0,
-            }),
+            EventType::Capabilities => {
+                let flags = decode_u8(&mut buf)?;
+                Ok(Self::Capabilities {
+                    enter_with_position: flags & 1 != 0,
+                    source_key_repeat: flags & 2 != 0,
+                })
+            }
             EventType::EnterWithPosition => Ok(Self::EnterWithPosition {
                 pos: decode_u8(&mut buf)?.try_into()?,
                 cross_axis: match decode_u8(&mut buf)? {
@@ -316,7 +324,12 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 }
                 ProtoEvent::Capabilities {
                     enter_with_position,
-                } => encode_u8(buf, len, enter_with_position as u8),
+                    source_key_repeat,
+                } => encode_u8(
+                    buf,
+                    len,
+                    enter_with_position as u8 | ((source_key_repeat as u8) << 1),
+                ),
                 ProtoEvent::EnterWithPosition {
                     pos,
                     cross_axis,
@@ -380,7 +393,7 @@ encode_impl!(f64);
 
 #[cfg(test)]
 mod tests {
-    use super::{Position, ProtoEvent};
+    use super::{EventType, InputEvent, KeyboardEvent, MAX_EVENT_SIZE, Position, ProtoEvent};
 
     #[test]
     fn enter_with_position_round_trips_the_transition() {
@@ -435,6 +448,7 @@ mod tests {
     fn capabilities_round_trip_without_changing_hello() {
         let event = ProtoEvent::Capabilities {
             enter_with_position: true,
+            source_key_repeat: true,
         };
 
         let (encoded, _) = event.into();
@@ -443,8 +457,45 @@ mod tests {
         match decoded {
             ProtoEvent::Capabilities {
                 enter_with_position,
-            } => assert!(enter_with_position),
+                source_key_repeat,
+            } => {
+                assert!(enter_with_position);
+                assert!(source_key_repeat);
+            }
             _ => panic!("decoded the wrong event type"),
+        }
+    }
+    #[test]
+    fn old_capabilities_do_not_enable_source_repeat() {
+        let mut bytes = [0; MAX_EVENT_SIZE];
+        bytes[0] = EventType::Capabilities.into();
+        bytes[1] = 1;
+        assert!(matches!(
+            ProtoEvent::try_from(bytes).unwrap(),
+            ProtoEvent::Capabilities {
+                enter_with_position: true,
+                source_key_repeat: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn source_key_states_round_trip_in_the_existing_key_packet() {
+        for state in [
+            0,
+            input_event::KEY_PRESSED_NO_REPEAT,
+            input_event::KEY_REPEATED,
+        ] {
+            let input = InputEvent::Keyboard(KeyboardEvent::Key {
+                time: 123,
+                key: 30,
+                state,
+            });
+            let (bytes, len) = ProtoEvent::Input(input).into();
+            assert_eq!(len, 10);
+            assert!(
+                matches!(ProtoEvent::try_from(bytes).unwrap(), ProtoEvent::Input(decoded) if decoded == input)
+            );
         }
     }
 }

@@ -119,7 +119,11 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let conn = LanMouseConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            authorized_keys.clone(),
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -249,6 +253,53 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::UpdateKeyMap(handle, key_map) => {
+                let Some((_, state)) = self.client_manager.get_state(handle) else {
+                    self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+                    return;
+                };
+                if !valid_key_map(&key_map) {
+                    self.notify_frontend(FrontendEvent::Error(
+                        "Map keyboard keys to keys, and mouse buttons to mouse buttons".into(),
+                    ));
+                    return;
+                }
+                if state.active {
+                    self.deactivate_client(handle);
+                }
+                self.client_manager.set_key_map(handle, key_map);
+                if state.active {
+                    self.activate_client(handle);
+                }
+                self.broadcast_client(handle);
+                self.save_config();
+            }
+            FrontendRequest::SetFileDragReady(ready) => {
+                #[cfg(target_os = "macos")]
+                input_capture::set_file_drag_ready(ready);
+                #[cfg(not(target_os = "macos"))]
+                let _ = ready;
+            }
+            FrontendRequest::PrepareFileDrag(handle) => self.capture.prepare_file_drag(handle),
+            FrontendRequest::StartFileDrag(handle) => self.capture.start_file_drag(handle, None),
+            FrontendRequest::StartFileDragFrom { handle, source_pid } => {
+                self.capture.start_file_drag(handle, Some(source_pid))
+            }
+            FrontendRequest::BeginNativeFileDrag { pid, window, x, y } => {
+                #[cfg(target_os = "macos")]
+                input_capture::begin_native_file_drag(pid, window, x, y);
+                #[cfg(not(target_os = "macos"))]
+                let _ = (pid, window, x, y);
+            }
+            FrontendRequest::CancelNativeFileDrag { pid } => {
+                #[cfg(target_os = "macos")]
+                input_capture::cancel_source_file_drag(pid);
+                #[cfg(not(target_os = "macos"))]
+                let _ = pid;
+            }
+            FrontendRequest::SetSharingShortcut(shortcut) => {
+                self.capture.set_sharing_shortcut(shortcut)
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -258,7 +309,7 @@ impl Service {
         let clients = clients
             .into_iter()
             .map(|(c, s)| ConfigClient {
-                ips: HashSet::from_iter(c.fix_ips),
+                ips: c.fix_ips,
                 hostname: c.hostname,
                 port: c.port,
                 pos: c.pos,
@@ -273,6 +324,9 @@ impl Service {
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "Settings applied but could not be saved: {e}"
+            )));
         }
     }
 
@@ -369,6 +423,12 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::SharingShortcutPressed(shortcut) => {
+                self.notify_frontend(FrontendEvent::SharingShortcutPressed {
+                    key_code: shortcut.key_code,
+                    modifiers: shortcut.modifiers,
+                });
+            }
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
@@ -385,6 +445,7 @@ impl Service {
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
             ICaptureEvent::ClientEntered(handle) => {
+                self.notify_frontend(FrontendEvent::CaptureEntered { handle });
                 log::info!("entering client {handle} ...");
                 let cmd = self.client_manager.get_enter_cmd(handle);
                 self.hooks.run(handle, HookState::Entered, cmd);
@@ -606,8 +667,12 @@ impl Service {
     }
 
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
+        let active = self
+            .client_manager
+            .get_state(handle)
+            .is_some_and(|(_, state)| state.active);
         // update state in event input emulator & input capture
-        if self.client_manager.set_pos(handle, pos) {
+        if self.client_manager.set_pos(handle, pos) && active {
             self.deactivate_client(handle);
             self.activate_client(handle);
         }
@@ -626,5 +691,34 @@ impl Service {
             .map(|(c, s)| FrontendEvent::State(handle, c, s))
             .unwrap_or(FrontendEvent::NoSuchClient(handle));
         self.notify_frontend(event);
+    }
+}
+
+fn valid_key_map(map: &HashMap<u32, u32>) -> bool {
+    use input_event::{BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, scancode};
+    let button = |code| {
+        matches!(
+            code,
+            BTN_LEFT | BTN_RIGHT | BTN_MIDDLE | BTN_BACK | BTN_FORWARD
+        )
+    };
+    map.iter().all(|(&from, &to)| {
+        if button(from) || button(to) {
+            button(from) && button(to)
+        } else {
+            scancode::Linux::try_from(from).is_ok() && scancode::Linux::try_from(to).is_ok()
+        }
+    })
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    #[test]
+    fn only_persistable_mappings_are_accepted() {
+        assert!(valid_key_map(&HashMap::from([(125, 29), (274, 275)])));
+        assert!(!valid_key_map(&HashMap::from([(274, 29)])));
+        assert!(!valid_key_map(&HashMap::from([(29, 274)])));
+        assert!(!valid_key_map(&HashMap::from([(u32::MAX, 29)])));
     }
 }

@@ -2,20 +2,27 @@ use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCr
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
+    array::CFArray,
+    base::{CFRelease, CFType, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
-    number::{CFBooleanRef, kCFBooleanTrue},
+    dictionary::CFDictionary,
+    number::{CFBooleanRef, CFNumber, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
-    string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+    string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
     display::{CGDisplay, CGPoint},
     event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-        CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
+        CGEventTapPlacement, CGEventTapProxy, CGEventType, CGMouseButton, CallbackResult,
+        EventField,
     },
     event_source::{CGEventSource, CGEventSourceStateID},
+    geometry::CGRect,
+    window::{
+        copy_window_info, kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly,
+    },
 };
 use futures_core::Stream;
 use input_event::{
@@ -30,7 +37,7 @@ use std::{
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
     thread::{self},
     time::{Duration, Instant},
 };
@@ -39,6 +46,133 @@ use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     oneshot,
 };
+
+static FILE_DRAG_CLOCK: OnceLock<Instant> = OnceLock::new();
+const LOCAL_FILE_DRAG_TAG: i64 = 0x4c4d4443414e434c; // LMDCANCL
+static FILE_DRAG_READY_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn file_drag_clock() -> u64 {
+    FILE_DRAG_CLOCK
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+pub fn set_file_drag_ready(ready: bool) {
+    FILE_DRAG_READY_UNTIL.store(
+        if ready { file_drag_clock() + 1500 } else { 0 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+fn file_drag_ready() -> bool {
+    let until = FILE_DRAG_READY_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && file_drag_clock() < until
+}
+
+/// End the source application's drag using the daemon's existing Accessibility
+/// permission. Process-addressed events never enter the shared input stream.
+pub fn cancel_source_file_drag(pid: i32) {
+    if pid <= 0 || pid == std::process::id() as i32 {
+        return;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::Private) else {
+        log::warn!("could not create source-drag cancellation event source");
+        return;
+    };
+    let (Ok(down), Ok(up)) = (
+        CGEvent::new_keyboard_event(source.clone(), 53, true),
+        CGEvent::new_keyboard_event(source, 53, false),
+    ) else {
+        log::warn!("could not create source-drag cancellation events");
+        return;
+    };
+    for event in [down, up] {
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LOCAL_FILE_DRAG_TAG);
+        event.post_to_pid(pid);
+    }
+    log::info!("sent source file drag cancellation to process {pid}");
+}
+
+/// Refuse to click until the relay is the frontmost window at the click point.
+fn relay_covers_point(pid: i32, window: i32, point: CGPoint) -> bool {
+    unsafe extern "C" {
+        fn CGWindowLevelForKey(key: i32) -> i32;
+    }
+    // kCGCursorWindowLevelKey. Quartz includes the pointer image in its list;
+    // that image cannot intercept a click and must not hide the relay from us.
+    let cursor_level = i64::from(unsafe { CGWindowLevelForKey(19) });
+    let Some(list) = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        0,
+    ) else {
+        return false;
+    };
+    // Quartz documents this array as dictionaries with CFString keys.
+    let list: CFArray<CFDictionary<CFString, CFType>> =
+        unsafe { CFArray::wrap_under_get_rule(list.as_concrete_TypeRef()) };
+    for info in list.iter() {
+        let number = |key: &str| {
+            info.find(CFString::new(key))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_i64())
+        };
+        if number("kCGWindowLayer") == Some(cursor_level) {
+            continue;
+        }
+        let bounds = info
+            .find(CFString::new("kCGWindowBounds"))
+            .and_then(|v| v.downcast::<CFDictionary>())
+            .and_then(|d| CGRect::from_dict_representation(&d));
+        if bounds.is_some_and(|r| r.contains(&point)) {
+            let covers = number("kCGWindowOwnerPID") == Some(i64::from(pid))
+                && number("kCGWindowNumber") == Some(i64::from(window));
+            if !covers {
+                log::debug!(
+                    "native drag window {window} at {point:?} is covered by window {:?}, owner {:?}, layer {:?}",
+                    number("kCGWindowNumber"),
+                    number("kCGWindowOwnerPID"),
+                    number("kCGWindowLayer")
+                );
+            }
+            return covers;
+        }
+    }
+    false
+}
+
+/// Establish WindowServer mouse tracking only after the relay covers the click.
+/// Process-addressed events neither select a dispatch window nor hold the global
+/// button state; a drag started with them ends at its first motion event.
+pub fn begin_native_file_drag(pid: i32, window: i32, x: i32, y: i32) -> bool {
+    if pid <= 0 || pid == std::process::id() as i32 || window <= 0 {
+        return false;
+    }
+    let point = CGPoint::new(f64::from(x), f64::from(y));
+    if !relay_covers_point(pid, window, point) {
+        return false;
+    }
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+        log::warn!("could not create native file drag event source");
+        return false;
+    };
+    let Ok(event) = CGEvent::new_mouse_event(
+        source,
+        CGEventType::LeftMouseDown,
+        point,
+        CGMouseButton::Left,
+    ) else {
+        log::warn!("could not create native file drag mouse-down");
+        return false;
+    };
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LOCAL_FILE_DRAG_TAG);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+    // A late UI activation must not resurrect a released drag. Retried startup
+    // requests may only inject one press for this held-button lifetime.
+    if !input_event::macos::claim_file_drag_button() {
+        return false;
+    }
+    event.post(CGEventTapLocation::HID);
+    log::info!("started native file drag over verified relay window {window}, process {pid}");
+    true
+}
 
 /// A tap disabled by timeout this often within this window is not having a
 /// one-off stall; stop re-enabling it and tear down instead
@@ -291,6 +425,9 @@ fn get_events(
 
     match ev_type {
         CGEventType::KeyDown => {
+            if ev.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+                return Ok(());
+            }
             let k = map_key(ev)?;
             result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
@@ -499,6 +636,11 @@ fn create_event_tap<'a>(
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
+        // Window-addressed drag events stay local, including while capturing.
+        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == LOCAL_FILE_DRAG_TAG
+        {
+            return CallbackResult::Keep;
+        }
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
         let mut res_events = vec![];
@@ -600,7 +742,9 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
-        } else if matches!(event_type, CGEventType::MouseMoved) {
+        } else if matches!(event_type, CGEventType::MouseMoved)
+            || (matches!(event_type, CGEventType::LeftMouseDragged) && file_drag_ready())
+        {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
@@ -641,7 +785,9 @@ fn create_event_tap<'a>(
     };
 
     let tap = CGEventTap::new(
-        CGEventTapLocation::Session,
+        // The integrated MMF helper processes Session events. Capturing at HID
+        // guarantees raw input reaches exactly one Mac's mouse engine.
+        CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::Default,
         cg_events_of_interest,
@@ -749,6 +895,8 @@ pub struct MacOSInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    key_repeat: super::key_repeat::KeyRepeat,
+    capture_state: Arc<Mutex<InputCaptureState>>,
 }
 
 impl MacOSInputCapture {
@@ -781,6 +929,7 @@ impl MacOSInputCapture {
         // wait for event tap creation result
         let run_loop = ready_rx.recv().expect("channel closed")?;
 
+        let capture_state = state.clone();
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -804,6 +953,11 @@ impl MacOSInputCapture {
             event_rx,
             notify_tx,
             run_loop,
+            capture_state,
+            key_repeat: {
+                let (delay, interval) = input_event::macos::system_key_repeat();
+                super::key_repeat::KeyRepeat::new(delay, interval)
+            },
         })
     }
 }
@@ -876,6 +1030,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("destroying capture {pos}");
@@ -886,6 +1041,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
@@ -895,6 +1051,7 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.key_repeat.clear();
         Ok(())
     }
 }
@@ -903,9 +1060,41 @@ impl Stream for MacOSInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+        // Drain physical events before considering repeats, especially key-up.
+        match self.event_rx.poll_recv(cx) {
+            Poll::Ready(None) => {
+                self.key_repeat.clear();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some((pos, event))) => {
+                self.key_repeat.observe(pos, event);
+                Poll::Ready(Some(Ok((pos, event))))
+            }
+            Poll::Pending => match self.key_repeat.poll(cx) {
+                Poll::Ready((pos, event)) => {
+                    // A tap timeout or permission change may release capture
+                    // without delivering a key-up. Never repeat after that.
+                    let active = self
+                        .capture_state
+                        .try_lock()
+                        .ok()
+                        .map(|state| state.current_pos == Some(pos));
+                    match active {
+                        Some(true) => Poll::Ready(Some(Ok((pos, event)))),
+                        Some(false) => {
+                            self.key_repeat.clear();
+                            Poll::Pending
+                        }
+                        None => {
+                            // Skip this tick if the tap is updating its state.
+                            // Register the reset timer before yielding.
+                            let _ = self.key_repeat.poll(cx);
+                            Poll::Pending
+                        }
+                    }
+                }
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }
@@ -1051,5 +1240,19 @@ mod tests {
         let b = desktop();
         assert!(!b.crosses(Position::Right, (0.0, 500.0), (-5.0, 0.0)));
         assert!(!b.crosses(Position::Left, (3359.0, 500.0), (5.0, 0.0)));
+    }
+}
+
+#[cfg(test)]
+mod file_drag_tests {
+    use super::*;
+    #[test]
+    fn file_drag_permission_is_a_short_lived_lease() {
+        set_file_drag_ready(true);
+        assert!(file_drag_ready());
+        FILE_DRAG_READY_UNTIL.store(file_drag_clock(), std::sync::atomic::Ordering::Relaxed);
+        assert!(!file_drag_ready());
+        set_file_drag_ready(false);
+        assert!(!file_drag_ready());
     }
 }

@@ -226,7 +226,7 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::Capabilities { .. } => {
-                                self.listener.reply(addr, ProtoEvent::Capabilities { enter_with_position: true }).await;
+                                self.listener.reply(addr, ProtoEvent::Capabilities { enter_with_position: true, source_key_repeat: cfg!(target_os = "macos") }).await;
                             }
                             _ => {}
                         }
@@ -250,7 +250,10 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr) => {
+                        self.emulation_proxy.remove(addr);
+                        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                    },
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -418,6 +421,8 @@ impl EmulationTask {
             EmulationEvent::EmulationDisabled,
         );
 
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::receiving(!self.handles.is_empty()).await;
         // create active handles
         if let Err(e) = self.create_clients(&mut emulation).await {
             emulation.terminate().await;
@@ -427,6 +432,8 @@ impl EmulationTask {
         let res = self.do_emulation_session(&mut emulation).await;
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
+        #[cfg(target_os = "macos")]
+        crate::mouse_engine::receiving(false).await;
         res
     }
 
@@ -497,6 +504,10 @@ impl EmulationTask {
                         None => {
                             let handle = self.next_id;
                             self.next_id += 1;
+                            #[cfg(target_os = "macos")]
+                            if self.handles.is_empty() {
+                                crate::mouse_engine::receiving(true).await;
+                            }
                             emulation.create(handle).await;
                             self.handles.insert(addr, handle);
                             handle
@@ -508,6 +519,10 @@ impl EmulationTask {
                     if !self.handles.contains_key(&addr) {
                         let handle = self.next_id;
                         self.next_id += 1;
+                        #[cfg(target_os = "macos")]
+                        if self.handles.is_empty() {
+                            crate::mouse_engine::receiving(true).await;
+                        }
                         emulation.create(handle).await;
                         self.handles.insert(addr, handle);
                     }
@@ -518,6 +533,10 @@ impl EmulationTask {
                 ProxyRequest::Remove(addr) => {
                     if let Some(handle) = self.handles.remove(&addr) {
                         emulation.destroy(handle).await;
+                        #[cfg(target_os = "macos")]
+                        if self.handles.is_empty() {
+                            crate::mouse_engine::receiving(false).await;
+                        }
                     }
                 }
                 ProxyRequest::Terminate => break Ok(()),

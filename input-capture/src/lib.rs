@@ -21,6 +21,12 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "macos")]
+pub use macos::{begin_native_file_drag, cancel_source_file_drag, set_file_drag_ready};
+
+#[cfg(target_os = "macos")]
+mod key_repeat;
+
 #[cfg(layer_shell)]
 mod layer_shell;
 
@@ -213,7 +219,8 @@ impl InputCapture {
             log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
             match state {
                 1 => self.pressed_keys.insert(scancode),
-                _ => self.pressed_keys.remove(&scancode),
+                0 => self.pressed_keys.remove(&scancode),
+                _ => false, // repeats do not change the held-key set
             };
         }
     }
