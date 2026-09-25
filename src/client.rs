@@ -238,6 +238,13 @@ impl ClientManager {
         }
     }
 
+    /// update the leave hook command of the client
+    pub(crate) fn set_leave_hook(&self, handle: ClientHandle, leave_hook: Option<String>) {
+        if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            c.leave_cmd = leave_hook;
+        }
+    }
+
     /// set resolving status of the client
     pub(crate) fn set_resolving(&self, handle: ClientHandle, status: bool) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {

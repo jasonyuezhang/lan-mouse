@@ -300,6 +300,9 @@ impl Service {
             FrontendRequest::SetSharingShortcut(shortcut) => {
                 self.capture.set_sharing_shortcut(shortcut)
             }
+            FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
+                self.update_leave_hook(handle, leave_hook)
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -681,6 +684,11 @@ impl Service {
 
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
+        self.broadcast_client(handle);
+    }
+
+    fn update_leave_hook(&mut self, handle: ClientHandle, leave_hook: Option<String>) {
+        self.client_manager.set_leave_hook(handle, leave_hook);
         self.broadcast_client(handle);
     }
 
