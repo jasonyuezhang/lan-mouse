@@ -20,3 +20,6 @@ mod file_bridge;
 
 #[cfg(target_os = "macos")]
 mod mouse_engine;
+
+#[cfg(target_os = "macos")]
+mod universal_control;

@@ -76,6 +76,9 @@ libc = "0.2.148"
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+core-graphics = "0.25.0"
+
 [features]
 default = [
     "gtk",

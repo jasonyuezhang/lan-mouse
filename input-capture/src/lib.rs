@@ -176,6 +176,7 @@ impl InputCapture {
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
+        self.pending.clear();
         self.capture.release().await
     }
 
@@ -357,4 +358,27 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn release_discards_begin_still_queued_for_another_client_on_the_same_edge() {
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        capture.create(1, Position::Left).await.unwrap();
+        capture.create(2, Position::Left).await.unwrap();
+        assert!(matches!(
+            capture.next().await,
+            Some(Ok((1, CaptureEvent::Begin { .. })))
+        ));
+        capture.release().await.unwrap();
+        assert!(matches!(
+            capture.next().await,
+            Some(Ok((_, CaptureEvent::Input(_))))
+        ));
+        capture.terminate().await.unwrap();
+    }
 }

@@ -65,6 +65,21 @@ build keeps intentional key repeat working. Automated tests cover sender stalls,
 release before repeat-task startup, negotiation, repeat filtering, and shutdown
 key/modifier cleanup without injecting real input.
 
+## macOS edge handoff stability
+
+The macOS capture backend allows a new edge crossing only when motion points
+toward that edge. It also leaves barriers inactive for 300 ms after capture
+starts or is released, including an incoming handoff and a sharing restart.
+Mouse and keyboard input remain local during this grace period; an established
+outgoing capture is unaffected. This prevents residual edge motion from
+immediately reversing a handoff. Deliberate return crossings work again when
+the grace expires. Both Macs need the updated daemon.
+
+Regression checks cover all four edge directions, stationary/inward motion
+outside the previous bounds, and grace expiry without extending it on jitter.
+For hardware verification, toggle Sharing off/on, cross in both directions
+using each Mac's own mouse, then verify the four-modifier emergency release.
+
 ## Option shortcuts on macOS
 
 The macOS receiver preserves left/right Option key flags when posting keyboard

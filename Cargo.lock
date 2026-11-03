@@ -1750,6 +1750,7 @@ version = "0.11.0"
 dependencies = [
  "cc",
  "clap",
+ "core-graphics",
  "env_logger",
  "futures",
  "input-capture",

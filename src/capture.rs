@@ -54,10 +54,10 @@ pub(crate) enum CaptureType {
     EnterOnly,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum CaptureRequest {
     /// capture must release the mouse
-    Release,
+    Release(tokio::sync::oneshot::Sender<()>),
     /// add a capture client (with its key remapping)
     Create(CaptureHandle, Position, CaptureType, KeyMap),
     /// destory a capture client
@@ -140,9 +140,9 @@ impl Capture {
             .expect("channel closed");
     }
 
-    pub(crate) fn release(&self) {
+    pub(crate) fn release(&self, released: tokio::sync::oneshot::Sender<()>) {
         self.request_tx
-            .send(CaptureRequest::Release)
+            .send(CaptureRequest::Release(released))
             .expect("channel closed");
     }
 
@@ -324,7 +324,7 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t, m) => self.add_capture(h, p, t, m),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::Release(released) => { let _ = released.send(()); }
                         CaptureRequest::SetSharingShortcut(shortcut) => {
                         self.sharing_shortcut = shortcut.and_then(crate::sharing_shortcut::CaptureShortcut::new);
                     }
@@ -454,7 +454,10 @@ impl CaptureTask {
                         }
                     },
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release(released) => {
+                        self.release_capture(capture).await?;
+                        let _ = released.send(());
+                    },
                     CaptureRequest::Create(h, p, t, m) => {
                         self.add_capture(h, p, t, m);
                         capture.create(h, p).await?;
