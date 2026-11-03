@@ -26,7 +26,60 @@ daemon build separately when upgrading (for this development setup,
 Run `macos-ui/test.sh` for state-decoding, identity association, updated discovery records, fingerprints, and latency parser checks.
 Run `macos-ui/test-discovery.sh` for live Bonjour invitation/progress/cancellation updates; it publishes two temporary test advertisements without authorizing input.
 
+## Litra Glow power
+
+Open the Lan Mouse menu bar and use **Litra Glow** to turn the light connected
+to this Mac on or off. It works independently of the sharing service. Connect
+one Litra Glow by USB; an unplugged light shows **Not connected**. The switch
+reads the light's actual power state when the menu opens and every two seconds
+while visible, including changes made with its physical button or Logitech's app.
+USB failures show an explanation and are retried while the menu stays open.
+
+This uses macOS's built-in USB HID support, with no extra utility or G HUB
+installation required. Brightness and color temperature stay at their existing
+settings. Power control is local and manual; moving between computers or quitting
+the control panel does not change the light's power. This integration supports
+Litra Glow only, with one connected light.
+
+From the repository root, run `sh macos-ui/test-litra.sh` for protocol checks.
+Add `--read` to check a connected light without changing power, or `--cycle`
+to switch it to the opposite state and restore its original power state.
+
+## Secure Input warning
+
+When any app turns on Secure Keyboard Entry (a focused password field,
+1Password's unlock prompt, a terminal's secure keyboard setting), macOS hides
+keystrokes from Lan Mouse, so typing stops reaching the other Mac while the
+pointer still moves. Other apps' hotkeys, such as Alfred's, stop too. While the
+menu is open it shows **Keyboard blocked by Secure Input** and names the app that
+was in front when secure input turned on, usually the one holding it. Quit that
+app or close its password prompt to restore typing. Lan Mouse cannot bypass
+this macOS protection.
+
+Run `macos-ui/test.sh` for parsing checks. To check detection live, compile
+`SecureInput.swift` with `SecureInputTests.swift` and run it with `--live`; it
+briefly turns on secure input itself.
+
 ## Sharing shortcut
+
+While **Sharing** is on, the daemon automatically suspends Apple Universal
+Control to prevent competing edge crossings from hiding the pointer. Turning
+Sharing off restores its prior setting. If Universal Control was already off,
+it stays off. The saved setting survives daemon restarts; after a forced kill,
+start sharing and turn it off normally to restore the original preference.
+
+If local keyboard/trackpad control remains stuck after Sharing is off, Universal
+Control may still be involved; stopping Lan Mouse does not stop that separate
+macOS service. On an affected Mac that does not need Universal Control, disable
+it persistently with `defaults -currentHost write com.apple.universalcontrol Disable -bool true`,
+then restart its process with `killall -KILL UniversalControl`. This disconnects
+Apple's cross-device keyboard/mouse sharing, including iPads, without logging out
+or closing other apps. Lan Mouse preserves an already-disabled setting across
+sharing sessions. To return to the default preference later, turn Sharing off,
+run `defaults -currentHost delete com.apple.universalcontrol Disable`, and restart
+Universal Control again. This is a conflict workaround, not proof of the cause
+of every input lockout. Do not leave keyboard remapping disabled unless a
+separate test identifies it as the cause.
 
 Choose **Sharing Shortcut…** in the menu bar or on Home, click **Record Shortcut…**,
 and press your preferred key combination. Include Command, Control, or Option;
@@ -283,3 +336,14 @@ grant can be used where macOS permits it. Some Macs require a separate grant for
 standalone test executable; if macOS rejects it, use the installed app for physical
 verification instead of changing privacy settings automatically. This is a native receiver test; a physical cross-Mac Orca/Slack
 drop is still a separate end-to-end check.
+
+### Native cursor handoff regression check
+
+Build with `cargo build --no-default-features --example macos_cursor_handoff_check`.
+Run `python3 macos-ui/test-cursor-handoff.py --driver <target-dir>/debug/examples/macos_cursor_handoff_check --identity <existing-daemon-signing-identity> --keychain <signing-keychain>`.
+The runner waits for the installed daemon to exit, then checks 12 alternating
+low/high return positions, cursor visibility, and removal of queued crossing
+events. It moves the pointer without clicking or typing and restores sharing
+afterwards. The same standalone-test permission limits described above apply.
+For an end-to-end check, cross to the other Mac near the bottom, move near the
+top, and cross back: the pointer should appear near the top and remain visible.

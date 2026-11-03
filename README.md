@@ -318,6 +318,21 @@ the gtk frontend (see conditional compilation).
 The [Lan Mouse Control companion](macos-ui/README.md) provides a menu-bar on/off
 switch, live health and network latency, a position arranger, keyboard/mouse
 mappings, an input debugger, and guided pairing/removal for two Macs.
+The menu bar also controls the power of a USB-connected Logitech Litra Glow on
+this Mac, independently of mouse and keyboard sharing.
+
+Between Macs, each crossing preserves the current relative position along the
+shared edge, including when returning to the first Mac. Capture releases its
+cursor lock and restores visibility before applying the incoming position.
+
+On macOS, Lan Mouse automatically suspends Apple Universal Control while its
+sharing daemon runs. Running both sharing systems can hide the receiving cursor
+when Universal Control also activates at the screen edge. Turning Sharing off
+restores your previous Universal Control setting; an already disabled setting
+stays disabled. The daemon checks for conflicts every two seconds and preserves
+the original preference across restarts in `universal-control-restore.json`
+beside its configuration. After a forced termination, restoration happens when
+the daemon next starts and stops normally.
 
 <details>
     <summary>Gtk Frontend</summary>

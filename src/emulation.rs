@@ -52,7 +52,7 @@ pub(crate) enum EmulationEvent {
     /// emulation was enabled
     EmulationEnabled,
     /// capture should be released
-    ReleaseNotify,
+    ReleaseNotify(tokio::sync::oneshot::Sender<()>),
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -156,6 +156,26 @@ impl IncomingTransition {
     }
 }
 
+/// A returning cursor must stop being pinned by capture before emulation
+/// places it on the new edge. Enqueuing release alone does not establish that
+/// order: the service, capture, and emulation each run in separate tasks.
+async fn release_capture(event_tx: &Sender<EmulationEvent>) -> bool {
+    let (released, completion) = tokio::sync::oneshot::channel();
+    if event_tx
+        .send(EmulationEvent::ReleaseNotify(released))
+        .is_err()
+    {
+        return false;
+    }
+    match tokio::time::timeout(Duration::from_secs(1), completion).await {
+        Ok(Ok(())) => true,
+        _ => {
+            log::warn!("capture did not finish releasing; deferring incoming handoff");
+            false
+        }
+    }
+}
+
 impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -175,7 +195,7 @@ impl ListenTask {
                                 }
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                    if !release_capture(&self.event_tx).await { continue; }
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.transitions.insert(addr, IncomingTransition::Legacy);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
@@ -189,7 +209,7 @@ impl ListenTask {
                                     _ => {
                                         if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                             log::info!("releasing capture: {addr} entered this device");
-                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            if !release_capture(&self.event_tx).await { continue; }
                                             if let Some(cross_axis) = cross_axis {
                                                 self.emulation_proxy.warp_cursor(
                                                     to_warp_position(pos),
@@ -600,6 +620,31 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::IncomingTransition;
+
+    #[tokio::test]
+    async fn incoming_handoff_waits_for_capture_to_finish_releasing() {
+        use super::{EmulationEvent, release_capture};
+        let (tx, mut rx) = local_channel::mpsc::channel();
+        let mut release = Box::pin(release_capture(&tx));
+        assert!(futures::poll!(&mut release).is_pending());
+        let Some(EmulationEvent::ReleaseNotify(completion)) = rx.recv().await else {
+            panic!("expected release request");
+        };
+        // Merely dequeuing the request is not enough. Placement and Ack must
+        // wait until the backend has actually shown and unpinned the cursor.
+        assert!(futures::poll!(&mut release).is_pending());
+        completion.send(()).unwrap();
+        assert!(release.await);
+    }
+
+    #[tokio::test]
+    async fn failed_capture_release_does_not_accept_the_handoff() {
+        let (tx, mut rx) = local_channel::mpsc::channel();
+        let mut release = Box::pin(super::release_capture(&tx));
+        assert!(futures::poll!(&mut release).is_pending());
+        drop(rx.recv().await);
+        assert!(!release.await);
+    }
 
     #[test]
     fn transition_accepts_a_new_serial_after_a_retry() {

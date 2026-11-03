@@ -684,15 +684,22 @@ impl Emulation for MacOSEmulation {
             Edge::Top | Edge::Bottom => (cross_coordinate, edge_coordinate),
         };
         let location = CGPoint::new(x as CGFloat, y as CGFloat);
-        // an absolute MouseMoved (like relative motion below) keeps the cursor
-        // and CG's tracking in sync; CGWarpMouseCursorPosition would not.
+        // Move synchronously so the first relative input cannot read the old
+        // capture position while the notification event is still queued.
+        CGDisplay::warp_mouse_cursor_position(location).map_err(EmulationError::CoreGraphics)?;
+        // Notify applications too, without making the capture tap interpret
+        // this absolute placement as physical motion across another edge.
         match CGEvent::new_mouse_event(
             self.event_source.clone(),
             CGEventType::MouseMoved,
             location,
             CGMouseButton::Left,
         ) {
-            Ok(event) => self.post_pointer_event(&event),
+            Ok(event) => {
+                event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 0);
+                event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0);
+                self.post_pointer_event(&event);
+            }
             Err(_) => log::warn!("cursor warp: mouse event creation failed"),
         }
         log::debug!("warped cursor to {edge:?} edge @ ({x}, {y})");

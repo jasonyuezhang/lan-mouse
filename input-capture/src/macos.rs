@@ -178,6 +178,7 @@ pub fn begin_native_file_drag(pid: i32, window: i32, x: i32, y: i32) -> bool {
 /// one-off stall; stop re-enabling it and tear down instead
 const TAP_TIMEOUTS_FATAL: usize = 3;
 const TAP_TIMEOUT_WINDOW: Duration = Duration::from_secs(30);
+const HANDOVER_GRACE: Duration = Duration::from_millis(300);
 
 /// Union of all displays. `xmin`/`ymin` is the first visible pixel,
 /// `xmax`/`ymax` is one past the last.
@@ -204,10 +205,10 @@ impl Bounds {
     fn crosses(&self, position: Position, location: (f64, f64), delta: (f64, f64)) -> bool {
         let (x, y) = (location.0 + delta.0, location.1 + delta.1);
         match position {
-            Position::Left => x < self.xmin,
-            Position::Right => x >= self.xmax,
-            Position::Top => y < self.ymin,
-            Position::Bottom => y >= self.ymax,
+            Position::Left => delta.0 < 0.0 && x < self.xmin,
+            Position::Right => delta.0 > 0.0 && x >= self.xmax,
+            Position::Top => delta.1 < 0.0 && y < self.ymin,
+            Position::Bottom => delta.1 > 0.0 && y >= self.ymax,
         }
     }
 }
@@ -218,10 +219,12 @@ struct InputCaptureState {
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
+    cursor_visibility: CursorVisibility,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
     bounds: Bounds,
+    barrier_ready_at: Instant,
     /// current state of modifier keys
     modifier_state: XMods,
     /// recent `TapDisabledByTimeout` events, to tell a one-off stall from a
@@ -231,12 +234,31 @@ struct InputCaptureState {
 
 #[derive(Debug)]
 enum ProducerEvent {
-    Release,
     Create(Position),
     Destroy(Position),
-    Grab(Position),
     EventTapDisabled,
     DisplayReconfigured,
+}
+
+/// Track our own Quartz hide request separately from capture. A failed show
+/// must remain retryable even after input has been released.
+#[derive(Debug, Default)]
+struct CursorVisibility {
+    hidden: bool,
+}
+
+impl CursorVisibility {
+    fn set_hidden<E>(
+        &mut self,
+        hidden: bool,
+        update: impl FnOnce(bool) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.hidden != hidden {
+            update(hidden)?;
+            self.hidden = hidden;
+        }
+        Ok(())
+    }
 }
 
 impl InputCaptureState {
@@ -244,8 +266,10 @@ impl InputCaptureState {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
+            cursor_visibility: CursorVisibility::default(),
             enter_position: None,
             bounds: Bounds::default(),
+            barrier_ready_at: Instant::now() + HANDOVER_GRACE,
             modifier_state: Default::default(),
             tap_timeouts: Vec::new(),
         };
@@ -253,7 +277,10 @@ impl InputCaptureState {
         Ok(res)
     }
 
-    fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
+    fn crossed(&mut self, event: &CGEvent, now: Instant) -> Option<Position> {
+        if now < self.barrier_ready_at {
+            return None;
+        }
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
@@ -311,7 +338,8 @@ impl InputCaptureState {
         Ok(())
     }
 
-    /// start the input capture by
+    /// Commit capture and visibility before publishing Begin. Deferring the
+    /// hide to another task lets a queued grab outlive a release.
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
         let edge_offset = 1.0;
@@ -323,7 +351,10 @@ impl InputCaptureState {
             Position::Bottom => location.y = self.bounds.ymax - edge_offset,
         };
         self.enter_position = Some(location);
-        self.reset_cursor()
+        self.reset_cursor()?;
+        self.set_cursor_hidden(true)?;
+        self.current_pos = Some(position);
+        Ok(())
     }
 
     /// resets the cursor to the position, where the capture started
@@ -333,12 +364,22 @@ impl InputCaptureState {
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
     }
 
-    fn hide_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn set_cursor_hidden(&mut self, hidden: bool) -> Result<(), CaptureError> {
+        self.cursor_visibility.set_hidden(hidden, |hidden| {
+            let result = if hidden {
+                CGDisplay::hide_cursor(&CGDisplay::main())
+            } else {
+                CGDisplay::show_cursor(&CGDisplay::main())
+            };
+            log::debug!("cursor visibility: requested hidden={hidden}, result={result:?}");
+            result.map_err(CaptureError::CoreGraphics)
+        })
     }
 
-    fn show_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
+    fn release_capture(&mut self) -> Result<(), CaptureError> {
+        self.current_pos = None;
+        self.barrier_ready_at = Instant::now() + HANDOVER_GRACE;
+        self.set_cursor_hidden(false)
     }
 
     async fn handle_producer_event(
@@ -347,26 +388,13 @@ impl InputCaptureState {
     ) -> Result<(), CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
-            ProducerEvent::Release => {
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
-            }
-            ProducerEvent::Grab(pos) => {
-                if self.current_pos.is_none() {
-                    self.hide_cursor()?;
-                    self.current_pos = Some(pos);
-                }
-            }
             ProducerEvent::Create(p) => {
                 self.active_clients.insert(p);
             }
             ProducerEvent::Destroy(p) => {
                 if let Some(current) = self.current_pos {
                     if current == p {
-                        self.show_cursor()?;
-                        self.current_pos = None;
+                        self.release_capture()?;
                     };
                 }
                 self.active_clients.remove(&p);
@@ -376,10 +404,7 @@ impl InputCaptureState {
                 // revoked, tap-timeout, etc). Release state so we
                 // don't leave the cursor hidden even if the outer
                 // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
+                self.release_capture()?;
                 return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
@@ -668,9 +693,9 @@ fn create_event_tap<'a>(
             state.tap_timeouts.push(now);
             if state.current_pos.is_some() {
                 log::warn!("CGEventTap disabled by timeout while capturing — releasing capture");
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-                let _ = notify_tx.try_send(ProducerEvent::Release);
+                state
+                    .release_capture()
+                    .unwrap_or_else(|e| log::warn!("{e}"));
             }
             if state.tap_timeouts.len() >= TAP_TIMEOUTS_FATAL {
                 log::error!(
@@ -707,10 +732,9 @@ fn create_event_tap<'a>(
             // notify the producer loop so the service can tear
             // down cleanly.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-            }
+            state
+                .release_capture()
+                .unwrap_or_else(|e| log::warn!("{e}"));
             notify_tx
                 .try_send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
@@ -746,21 +770,22 @@ fn create_event_tap<'a>(
             || (matches!(event_type, CGEventType::LeftMouseDragged) && file_drag_ready())
         {
             // Did we cross a barrier?
-            if let Some(new_pos) = state.crossed(cg_ev) {
-                capture_position = Some(new_pos);
+            if let Some(new_pos) = state.crossed(cg_ev, Instant::now()) {
+                // Never hide the pointer if Begin cannot reach the consumer.
+                let permit = match event_tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        log::warn!("cannot begin capture: {e}");
+                        return CallbackResult::Keep;
+                    }
+                };
                 let cross_axis = state.cross_axis(cg_ev, new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin { cross_axis });
-                // a closed channel (instance being dropped) must not
-                // panic-abort the daemon from inside the tap callback
-                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
-                    log::error!("failed to notify producer of capture start: {e}");
-                    let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                    state.current_pos = None;
+                if let Err(e) = state.start_capture(cg_ev, new_pos) {
+                    log::warn!("cannot begin capture: {e}");
                     return CallbackResult::Keep;
                 }
+                permit.send((new_pos, CaptureEvent::Begin { cross_axis }));
+                capture_position = Some(new_pos);
             }
         }
 
@@ -945,8 +970,11 @@ impl MacOSInputCapture {
                     _ = &mut tap_exit_rx => break,
                 }
             }
-            // show cursor
-            let _ = CGDisplay::show_cursor(&CGDisplay::main());
+            state
+                .lock()
+                .await
+                .release_capture()
+                .unwrap_or_else(|e| log::warn!("{e}"));
         });
 
         Ok(Self {
@@ -1042,17 +1070,16 @@ impl Capture for MacOSInputCapture {
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         self.key_repeat.clear();
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
-        });
-        Ok(())
+        let mut state = self.capture_state.lock().await;
+        let result = state.release_capture();
+        // Events captured before this handoff must not start another outgoing
+        // session afterwards. The state lock prevents the tap adding more.
+        while self.event_rx.try_recv().is_ok() {}
+        result
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        self.key_repeat.clear();
-        Ok(())
+        self.release().await
     }
 }
 
@@ -1191,7 +1218,51 @@ bitflags! {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, Position};
+    use super::*;
+
+    #[test]
+    fn repeated_release_and_shutdown_balance_one_cursor_hide() {
+        let mut cursor = CursorVisibility::default();
+        let mut calls = Vec::new();
+        for hidden in [true, true, false, false, true, false, false] {
+            cursor
+                .set_hidden(hidden, |hidden| {
+                    calls.push(hidden);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        }
+        assert_eq!(calls, [true, false, true, false]);
+        assert!(!cursor.hidden);
+    }
+
+    #[test]
+    fn failed_show_is_retried_after_capture_has_been_released() {
+        let mut cursor = CursorVisibility::default();
+        cursor.set_hidden(true, |_| Ok::<_, ()>(())).unwrap();
+        assert!(cursor.set_hidden(false, |_| Err(())).is_err());
+        assert!(cursor.hidden);
+        let mut retried = false;
+        cursor
+            .set_hidden(false, |_| {
+                retried = true;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(retried);
+        assert!(!cursor.hidden);
+    }
+
+    #[test]
+    fn failed_hide_does_not_create_an_unmatched_show() {
+        let mut cursor = CursorVisibility::default();
+        assert!(cursor.set_hidden(true, |_| Err(())).is_err());
+        cursor
+            .set_hidden(false, |_| -> Result<(), ()> {
+                panic!("a failed hide must not be balanced with a show")
+            })
+            .unwrap();
+    }
 
     // 1920x1080 main display with a 1440x900 one to its right; x: 0..3360
     fn desktop() -> Bounds {
@@ -1240,6 +1311,55 @@ mod tests {
         let b = desktop();
         assert!(!b.crosses(Position::Right, (0.0, 500.0), (-5.0, 0.0)));
         assert!(!b.crosses(Position::Left, (3359.0, 500.0), (5.0, 0.0)));
+    }
+
+    #[test]
+    fn events_outside_old_bounds_must_still_move_toward_the_barrier() {
+        let bounds = desktop();
+        for (position, location, inward, along) in [
+            (Position::Left, (-2.0, 500.0), (1.0, 0.0), (0.0, 1.0)),
+            (Position::Right, (3362.0, 500.0), (-1.0, 0.0), (0.0, 1.0)),
+            (Position::Top, (800.0, -2.0), (0.0, 1.0), (1.0, 0.0)),
+            (Position::Bottom, (800.0, 1082.0), (0.0, -1.0), (1.0, 0.0)),
+        ] {
+            assert!(!bounds.crosses(position, location, (0.0, 0.0)));
+            assert!(!bounds.crosses(position, location, inward));
+            assert!(!bounds.crosses(position, location, along));
+        }
+    }
+
+    #[test]
+    fn startup_and_release_ignore_edge_jitter_without_extending_the_grace() {
+        for (position, location, delta) in [
+            (Position::Left, (0.0, 500.0), (-3, 0)),
+            (Position::Right, (3359.0, 500.0), (3, 0)),
+            (Position::Top, (800.0, 0.0), (0, -3)),
+            (Position::Bottom, (800.0, 1079.0), (0, 3)),
+        ] {
+            let mut state = InputCaptureState::new().unwrap();
+            state.bounds = desktop();
+            state.active_clients.insert(position);
+            let source = CGEventSource::new(CGEventSourceStateID::Private).unwrap();
+            let event = CGEvent::new_mouse_event(
+                source,
+                CGEventType::MouseMoved,
+                CGPoint::new(location.0, location.1),
+                CGMouseButton::Left,
+            )
+            .unwrap();
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, delta.0);
+            event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, delta.1);
+            let ready = state.barrier_ready_at;
+            assert_eq!(state.crossed(&event, ready - Duration::from_nanos(1)), None);
+            assert_eq!(state.crossed(&event, ready), Some(position));
+            state.release_capture().unwrap();
+            let ready = state.barrier_ready_at;
+            for _ in 0..3 {
+                assert_eq!(state.crossed(&event, ready - Duration::from_nanos(1)), None);
+                assert_eq!(state.barrier_ready_at, ready);
+            }
+            assert_eq!(state.crossed(&event, ready), Some(position));
+        }
     }
 }
 

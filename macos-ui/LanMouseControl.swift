@@ -8,6 +8,7 @@ typealias ViewState<Value> = SwiftUI.State<Value>
 
 @main struct LanMouseControl: App {
     @StateObject private var model: ControlModel
+    @StateObject private var light = LitraGlowController()
     init() {
         let model = ControlModel()
         _model = StateObject(wrappedValue: model)
@@ -22,15 +23,17 @@ typealias ViewState<Value> = SwiftUI.State<Value>
             }.frame(minWidth: 780, minHeight: 560)
         }.defaultSize(width: 820, height: 620)
         MenuBarExtra("Lan Mouse", systemImage: model.running == true ? "computermouse.fill" : "computermouse") {
-            MenuPanel(model: model)
+            MenuPanel(model: model, light: light)
         }.menuBarExtraStyle(.window)
     }
 }
 
 struct MenuPanel: View {
     @ObservedObject var model: ControlModel
+    @ObservedObject var light: LitraGlowController
     @Environment(\.openWindow) var openWindow
     @ViewState private var menuAnchor = NSView()
+    @ViewState private var secureInput: SecureInput.Owner?
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 7) {
@@ -50,6 +53,15 @@ struct MenuPanel: View {
             if let error = model.error {
                 Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
+            if let owner = secureInput {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Keyboard blocked by Secure Input", systemImage: "lock.fill").foregroundStyle(.orange)
+                    Text("Typing can't reach the other Mac and hotkeys don't work. It was turned on while \(owner.name) was in front; quit it or close its password prompt.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }.padding(.horizontal, 8).padding(.vertical, 4)
+            }
+            Divider()
+            LitraGlowMenu(light: light)
             Divider()
             ForEach([(0, "Home"), (4, "Computers"), (1, "Arrangement"), (5, "Mouse"), (2, "Keys & Buttons"), (3, "Troubleshooting")], id: \.0) { index, name in
                 MenuOption(title: name) {
@@ -69,8 +81,47 @@ struct MenuPanel: View {
         }.font(.system(size: 13)).padding(6).frame(width: 236)
             .background(MenuWindowAnchor(view: menuAnchor).frame(width: 0, height: 0))
             .onExitCommand { menuAnchor.window?.orderOut(nil) }
+            .task {
+                // Poll only while the menu is visible; the registry read is cheap.
+                while !Task.isCancelled {
+                    secureInput = SecureInput.owner()
+                    do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { break }
+                }
+            }
     }
 
+}
+
+private struct LitraGlowMenu: View {
+    @ObservedObject var light: LitraGlowController
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let power = light.power {
+                Toggle("Litra Glow", isOn: Binding(get: { power }, set: { value in
+                    Task { await light.update(power: value) }
+                }))
+                .toggleStyle(.switch).controlSize(.small).disabled(light.busy)
+                .help("Turn the Litra Glow connected to this Mac on or off")
+            } else {
+                HStack {
+                    Text("Litra Glow")
+                    Spacer()
+                    Text(light.busy ? "Checking…" : light.error == nil ? "Not connected" : "Unavailable")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let error = light.error {
+                Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }.padding(.horizontal, 8).padding(.vertical, 6)
+            .task {
+                // Poll only while the menu is visible; never persist a guessed state.
+                while !Task.isCancelled {
+                    await light.update()
+                    do { try await Task.sleep(nanoseconds: 2_000_000_000) } catch { break }
+                }
+            }
+    }
 }
 
 private struct SharingShortcutMenu: View {

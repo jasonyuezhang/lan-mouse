@@ -22,6 +22,9 @@ use wayland_client::{
 pub enum EmulationError {
     #[error("event stream closed")]
     EndOfStream,
+    #[cfg(target_os = "macos")]
+    #[error("CoreGraphics error: {0}")]
+    CoreGraphics(core_graphics::base::CGError),
     #[cfg(libei)]
     #[error("libei error: `{0}`")]
     Libei(#[from] reis::Error),

@@ -158,6 +158,12 @@ impl Service {
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
+        #[cfg(target_os = "macos")]
+        let universal_control = crate::universal_control::UniversalControl::suspend(
+            self.config
+                .config_path()
+                .with_file_name("universal-control-restore.json"),
+        );
         let active = self.client_manager.active_clients();
         for handle in active.iter() {
             // small hack: `activate_client()` checks, if the client
@@ -198,6 +204,9 @@ impl Service {
         self.resolver.terminate().await;
         log::debug!("terminating hooks ...");
         self.hooks.terminate().await;
+
+        #[cfg(target_os = "macos")]
+        universal_control.restore().await;
 
         Ok(())
     }
@@ -406,7 +415,7 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify(released) => self.capture.release(released),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
