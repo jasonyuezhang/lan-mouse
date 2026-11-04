@@ -41,6 +41,7 @@ const CG_PROGRESS: u8 = 124;
 const CG_EXIT_SPEED_X: u8 = 129;
 const CG_EXIT_SPEED_Y: u8 = 130;
 const CG_PHASE: u8 = 132;
+const CG_INVERTED_FROM_DEVICE: u8 = 136;
 const CG_FLAVOR: u8 = 138;
 
 type CreateFn = unsafe extern "C" fn(*const c_void, u32, u64, u32) -> HidEvent;
@@ -137,6 +138,15 @@ pub(super) fn attach_hid_event(event: &CGEvent, trackpad: &TrackpadEvent) -> boo
         return false;
     };
     let phase = integer(trackpad, CG_PHASE);
+    // The captured progress already has natural scrolling applied ("inverted
+    // from device"); the Dock applies it again to an attached IOHIDEvent, so
+    // undo it here or swipes go the wrong way and spreading for Show Desktop
+    // opens Launchpad / Apps instead (same as Mac Mouse Fix's macOS 27 path).
+    let sign = if integer(trackpad, CG_INVERTED_FROM_DEVICE) != 0 {
+        -1.0
+    } else {
+        1.0
+    };
     let flavor = match integer(trackpad, CG_FLAVOR) {
         0 => FLAVOR_DOCK_PRIMARY,
         f => f,
@@ -159,13 +169,25 @@ pub(super) fn attach_hid_event(event: &CGEvent, trackpad: &TrackpadEvent) -> boo
             integer(trackpad, CG_MOTION) as isize,
         );
         (api.set_integer)(hid, DOCK_SWIPE_FLAVOR, flavor as isize);
-        (api.set_float)(hid, DOCK_SWIPE_PROGRESS, double(trackpad, CG_PROGRESS));
+        (api.set_float)(
+            hid,
+            DOCK_SWIPE_PROGRESS,
+            sign * double(trackpad, CG_PROGRESS),
+        );
         // the exit velocity decides whether the swipe completes or springs back
         if matches!(phase, PHASE_ENDED | PHASE_CANCELLED) {
             let velocity = (api.create)(std::ptr::null(), HID_TYPE_VELOCITY, 0, 0);
             if !velocity.is_null() {
-                (api.set_float)(velocity, VELOCITY_X, double(trackpad, CG_EXIT_SPEED_X));
-                (api.set_float)(velocity, VELOCITY_Y, double(trackpad, CG_EXIT_SPEED_Y));
+                (api.set_float)(
+                    velocity,
+                    VELOCITY_X,
+                    sign * double(trackpad, CG_EXIT_SPEED_X),
+                );
+                (api.set_float)(
+                    velocity,
+                    VELOCITY_Y,
+                    sign * double(trackpad, CG_EXIT_SPEED_Y),
+                );
                 (api.append)(hid, velocity, 0);
                 CFRelease(velocity);
             }
