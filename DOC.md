@@ -79,11 +79,19 @@ Mac recreates it. Gesture types 29/30 use undocumented CGEvent fields that a
 macOS update could change. The capture side needs a second HID tap with a raw
 event type, because `core_graphics::CGEventType` cannot represent them.
 
+Dock swipes (type 30) need more than fields: since macOS 27 the Dock reads the
+IOHIDEvent attached to the event, so the receiver builds a DockSwipe IOHIDEvent
+(motion, progress, phase, exit velocity) and attaches it with SkyLight's
+private `SLEventSetIOHIDEvent`, then posts it at the session tap. Both private
+symbols are looked up at runtime; if they go away, swipes stay inert instead of
+breaking the daemon.
+
 Both peers must advertise the `macos_trackpad` capability (bit 2 of
 `Capabilities`). Linux, Windows and older peers keep receiving plain pixel
 scroll and never see gestures, so mixed setups are unaffected. Run
 `cargo run -p input-emulation --example macos_trackpad_replay_check` with
-sharing paused to confirm the local Mac accepts recreated events.
+sharing paused to confirm the local Mac accepts recreated events; its last step
+switches one Space over and back.
 
 ## macOS edge handoff stability
 

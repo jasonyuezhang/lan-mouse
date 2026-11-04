@@ -1,7 +1,8 @@
 //! Posts a zero-magnification pinch and a zero-delta phased scroll through the
 //! macOS emulation backend, so a session-level event tap can confirm macOS
 //! accepts recreated gesture events (type 29 with subtype 8 and phase intact).
-//! Nothing zooms or scrolls.
+//! Nothing zooms or scrolls; the Dock swipe at the end visibly switches one
+//! Space over and back.
 //!
 //!   cargo run -p input-emulation --example macos_trackpad_replay_check
 //!
@@ -27,7 +28,7 @@ async fn run() {
     use input_emulation::{Backend, InputEmulation};
     use input_event::{
         Event, TrackpadEvent,
-        trackpad::{CG_GESTURE, CG_SCROLL_WHEEL, TrackpadValue::*},
+        trackpad::{CG_DOCK_GESTURE, CG_GESTURE, CG_SCROLL_WHEEL, TrackpadValue::*},
     };
     use std::time::Duration;
 
@@ -60,5 +61,33 @@ async fn run() {
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
     println!("posted scroll: 3 frames (phases 1,2,4)");
+
+    // Horizontal Dock swipe one Space over and back (fields as captured from a
+    // real three-finger swipe). This one is visible: the Space changes twice.
+    for direction in [-1.0, 1.0] {
+        for step in 1..=20 {
+            let phase = match step {
+                1 => 1,
+                20 => 4,
+                _ => 2,
+            };
+            let mut swipe = TrackpadEvent::new(CG_DOCK_GESTURE);
+            swipe.push(110, Integer(23)).unwrap(); // kIOHIDEventTypeDockSwipe
+            swipe.push(123, Integer(1)).unwrap(); // horizontal
+            swipe
+                .push(124, Double(direction * step as f64 / 20.0))
+                .unwrap();
+            swipe.push(132, Integer(phase)).unwrap();
+            swipe.push(138, Integer(3)).unwrap(); // dock primary
+            if phase == 4 {
+                swipe.push(129, Double(direction * 10.0)).unwrap();
+                swipe.push(130, Double(direction * 10.0)).unwrap();
+            }
+            emulation.consume(Event::Trackpad(swipe), 0).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    println!("posted dock swipe: one Space over and back");
     emulation.terminate().await;
 }

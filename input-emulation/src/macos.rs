@@ -15,7 +15,7 @@ use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     TrackpadEvent, scancode,
     screen::{Edge, EdgeSegments, Rect},
-    trackpad::{CG_SCROLL_WHEEL, TrackpadValue},
+    trackpad::{CG_DOCK_GESTURE, CG_SCROLL_WHEEL, TrackpadValue},
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
+
+mod dock_swipe;
 
 // Must match Mac Mouse Fix's kMFLanMouseEventTag. A tag identifies the
 // virtual device; it does not authorize a connection or enable the engine.
@@ -143,6 +145,16 @@ impl MacOSEmulation {
                 TrackpadValue::Integer(v) => event.set_integer_value_field(field.into(), v),
                 TrackpadValue::Double(v) => event.set_double_value_field(field.into(), v),
             }
+        }
+        if trackpad.cg_type() == CG_DOCK_GESTURE {
+            if !dock_swipe::attach_hid_event(&event, trackpad) {
+                log::debug!("dock swipe replay unavailable on this macOS");
+            }
+            // Posted after the HID taps: the Dock picks it up from here (as
+            // with Mac Mouse Fix), and this Mac's own capture tap never sees it.
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LAN_MOUSE_EVENT_TAG);
+            event.post(CGEventTapLocation::Session);
+            return;
         }
         self.post_pointer_event(&event);
     }
