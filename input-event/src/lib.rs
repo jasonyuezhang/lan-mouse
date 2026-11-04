@@ -14,6 +14,9 @@ pub const BUTTON_ADOPT_FILE_DRAG: u32 = 2;
 pub mod error;
 pub mod scancode;
 pub mod screen;
+pub mod trackpad;
+
+pub use trackpad::TrackpadEvent;
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
@@ -51,12 +54,17 @@ pub enum KeyboardEvent {
     },
 }
 
+// Trackpad frames are ~300 bytes; copying that per event is negligible and
+// keeps `Event: Copy` (boxing would ripple through every pipeline stage).
+#[allow(clippy::large_enum_variant)]
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum Event {
     /// pointer event (motion / button / axis)
     Pointer(PointerEvent),
     /// keyboard events (key / modifiers)
     Keyboard(KeyboardEvent),
+    /// native macOS gesture / phased scroll, only sent between Macs
+    Trackpad(TrackpadEvent),
 }
 
 impl Display for PointerEvent {
@@ -127,6 +135,7 @@ impl Display for Event {
         match self {
             Event::Pointer(p) => write!(f, "{p}"),
             Event::Keyboard(k) => write!(f, "{k}"),
+            Event::Trackpad(t) => write!(f, "{t}"),
         }
     }
 }

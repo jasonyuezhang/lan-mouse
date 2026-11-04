@@ -77,6 +77,9 @@ impl Emulation for WindowsEmulation {
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
+            // Native macOS events only reach Macs; InputEmulation converts
+            // any stray trackpad scroll to Axis first.
+            Event::Trackpad(_) => {}
         }
         // FIXME
         Ok(())

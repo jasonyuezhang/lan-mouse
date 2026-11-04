@@ -1,4 +1,7 @@
-use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+use input_event::{
+    Event as InputEvent, KeyboardEvent, PointerEvent,
+    trackpad::{MAX_TRACKPAD_FIELDS, TrackpadEvent, TrackpadValue},
+};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -7,10 +10,23 @@ use std::{
 };
 use thiserror::Error;
 
+/// Largest event a pre-trackpad peer accepts: pointer motion
+/// (type: u8, time: u32, dx: f64, dy: f64). Only peers advertising
+/// `macos_trackpad` are sent anything larger.
+pub const LEGACY_MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+
+/// Trackpad event: type, cg type, field count, double mask, then
+/// `(id: u8, value: 8 bytes)` per field.
+const MAX_TRACKPAD_EVENT_SIZE: usize = 3 * size_of::<u8>()
+    + size_of::<u32>()
+    + MAX_TRACKPAD_FIELDS * (size_of::<u8>() + size_of::<u64>());
+
 /// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+pub const MAX_EVENT_SIZE: usize = if MAX_TRACKPAD_EVENT_SIZE > LEGACY_MAX_EVENT_SIZE {
+    MAX_TRACKPAD_EVENT_SIZE
+} else {
+    LEGACY_MAX_EVENT_SIZE
+};
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -23,6 +39,8 @@ pub enum ProtocolError {
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
     #[error("invalid cross-axis presence: `{0}`")]
     InvalidCrossAxisPresence(u8),
+    #[error("invalid trackpad field count: `{0}`")]
+    InvalidTrackpadFieldCount(u8),
 }
 
 /// Position of a client
@@ -48,6 +66,8 @@ impl Display for Position {
 }
 
 /// main lan-mouse protocol event type
+// Large because of `InputEvent::Trackpad`; see input_event::Event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
@@ -78,6 +98,9 @@ pub enum ProtoEvent {
         enter_with_position: bool,
         /// Receiver accepts source-timed keyboard states 2 and 3.
         source_key_repeat: bool,
+        /// Receiver replays native macOS gestures and phased scrolling
+        /// ([`InputEvent::Trackpad`]).
+        macos_trackpad: bool,
     },
     /// Atomically enter a peer and place the cursor on its corresponding
     /// physical edge. `serial` makes retries idempotent and rejects stale
@@ -112,10 +135,11 @@ impl Display for ProtoEvent {
             ProtoEvent::Capabilities {
                 enter_with_position,
                 source_key_repeat,
+                macos_trackpad,
             } => {
                 write!(
                     f,
-                    "Capabilities({enter_with_position}, {source_key_repeat})"
+                    "Capabilities({enter_with_position}, {source_key_repeat}, {macos_trackpad})"
                 )
             }
             ProtoEvent::EnterWithPosition {
@@ -150,6 +174,7 @@ pub enum EventType {
     Hello,
     Capabilities,
     EnterWithPosition,
+    Trackpad,
 }
 
 impl ProtoEvent {
@@ -166,6 +191,7 @@ impl ProtoEvent {
                     KeyboardEvent::Key { .. } => EventType::KeyboardKey,
                     KeyboardEvent::Modifiers { .. } => EventType::KeyboardModifiers,
                 },
+                InputEvent::Trackpad(_) => EventType::Trackpad,
             },
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
@@ -241,6 +267,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 Ok(Self::Capabilities {
                     enter_with_position: flags & 1 != 0,
                     source_key_repeat: flags & 2 != 0,
+                    macos_trackpad: flags & 4 != 0,
                 })
             }
             EventType::EnterWithPosition => Ok(Self::EnterWithPosition {
@@ -253,6 +280,26 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 epoch: decode_u64(&mut buf)?,
                 serial: decode_u32(&mut buf)?,
             }),
+            EventType::Trackpad => {
+                let mut event = TrackpadEvent::new(decode_u8(&mut buf)?);
+                let count = decode_u8(&mut buf)?;
+                if count as usize > MAX_TRACKPAD_FIELDS {
+                    return Err(ProtocolError::InvalidTrackpadFieldCount(count));
+                }
+                let double_mask = decode_u32(&mut buf)?;
+                for i in 0..count {
+                    let id = decode_u8(&mut buf)?;
+                    let bits = decode_u64(&mut buf)?;
+                    let value = if double_mask & (1 << i) != 0 {
+                        TrackpadValue::Double(f64::from_bits(bits))
+                    } else {
+                        TrackpadValue::Integer(bits as i64)
+                    };
+                    // cannot fail: count is bounded above
+                    let _ = event.push(id, value);
+                }
+                Ok(Self::Input(InputEvent::Trackpad(event)))
+            }
         }
     }
 }
@@ -311,6 +358,30 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                             encode_u32(buf, len, group);
                         }
                     },
+                    InputEvent::Trackpad(t) => {
+                        encode_u8(buf, len, t.cg_type());
+                        let mut count = 0u8;
+                        let mut double_mask = 0u32;
+                        for (i, (_, v)) in t.fields().enumerate() {
+                            count += 1;
+                            if matches!(v, TrackpadValue::Double(_)) {
+                                double_mask |= 1 << i;
+                            }
+                        }
+                        encode_u8(buf, len, count);
+                        encode_u32(buf, len, double_mask);
+                        for (id, v) in t.fields() {
+                            encode_u8(buf, len, id);
+                            encode_u64(
+                                buf,
+                                len,
+                                match v {
+                                    TrackpadValue::Integer(v) => v as u64,
+                                    TrackpadValue::Double(v) => v.to_bits(),
+                                },
+                            );
+                        }
+                    }
                 },
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
@@ -325,10 +396,13 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Capabilities {
                     enter_with_position,
                     source_key_repeat,
+                    macos_trackpad,
                 } => encode_u8(
                     buf,
                     len,
-                    enter_with_position as u8 | ((source_key_repeat as u8) << 1),
+                    enter_with_position as u8
+                        | ((source_key_repeat as u8) << 1)
+                        | ((macos_trackpad as u8) << 2),
                 ),
                 ProtoEvent::EnterWithPosition {
                     pos,
@@ -449,6 +523,7 @@ mod tests {
         let event = ProtoEvent::Capabilities {
             enter_with_position: true,
             source_key_repeat: true,
+            macos_trackpad: true,
         };
 
         let (encoded, _) = event.into();
@@ -458,9 +533,11 @@ mod tests {
             ProtoEvent::Capabilities {
                 enter_with_position,
                 source_key_repeat,
+                macos_trackpad,
             } => {
                 assert!(enter_with_position);
                 assert!(source_key_repeat);
+                assert!(macos_trackpad);
             }
             _ => panic!("decoded the wrong event type"),
         }
@@ -475,8 +552,53 @@ mod tests {
             ProtoEvent::Capabilities {
                 enter_with_position: true,
                 source_key_repeat: false,
+                macos_trackpad: false,
             }
         ));
+    }
+
+    #[test]
+    fn older_peers_capabilities_do_not_enable_trackpad() {
+        let mut bytes = [0; MAX_EVENT_SIZE];
+        bytes[0] = EventType::Capabilities.into();
+        bytes[1] = 0b011;
+        assert!(matches!(
+            ProtoEvent::try_from(bytes).unwrap(),
+            ProtoEvent::Capabilities {
+                enter_with_position: true,
+                source_key_repeat: true,
+                macos_trackpad: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn full_dock_swipe_round_trips_within_max_event_size() {
+        use input_event::trackpad::{CG_DOCK_GESTURE, MAX_TRACKPAD_FIELDS, TrackpadValue};
+        let mut swipe = input_event::TrackpadEvent::new(CG_DOCK_GESTURE);
+        for i in 0..MAX_TRACKPAD_FIELDS as u8 {
+            let value = if i % 2 == 0 {
+                TrackpadValue::Integer(-(i as i64) - 1)
+            } else {
+                TrackpadValue::Double(f64::from(i) * -0.0195)
+            };
+            swipe.push(110 + i, value).unwrap();
+        }
+        let input = InputEvent::Trackpad(swipe);
+        let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Input(input).into();
+        assert_eq!(len, MAX_EVENT_SIZE);
+        assert!(
+            matches!(ProtoEvent::try_from(bytes).unwrap(), ProtoEvent::Input(decoded) if decoded == input)
+        );
+    }
+
+    #[test]
+    fn trackpad_field_count_beyond_capacity_is_rejected() {
+        let mut bytes = [0; MAX_EVENT_SIZE];
+        bytes[0] = EventType::Trackpad.into();
+        bytes[1] = 29;
+        bytes[2] = 33;
+        assert!(ProtoEvent::try_from(bytes).is_err());
     }
 
     #[test]

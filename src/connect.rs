@@ -150,6 +150,24 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
+        if let ProtoEvent::Input(input_event::Event::Trackpad(trackpad)) = event {
+            if !self.client_manager.supports_macos_trackpad(handle) {
+                // Older or non-Mac peer: pixel scroll only, gestures dropped.
+                for axis in trackpad.scroll_fallback() {
+                    let axis = ProtoEvent::Input(input_event::Event::Pointer(axis));
+                    self.send_one(axis, handle).await?;
+                }
+                return Ok(());
+            }
+        }
+        self.send_one(event, handle).await
+    }
+
+    async fn send_one(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
         let Some(event) = keyboard_event_for_peer(
             event,
             self.client_manager.supports_source_key_repeat(handle),
@@ -212,7 +230,7 @@ async fn connect_to_handle(
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
-    client_manager.set_peer_protocol_capabilities(handle, false, false);
+    client_manager.set_peer_protocol_capabilities(handle, false, false, false);
     // sending did not work, figure out active conn.
     if let Some(addrs) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
@@ -246,11 +264,7 @@ async fn connect_to_handle(
         if let Err(e) = conn.send(&buf[..len]).await {
             log::debug!("hello send to {addr} failed: {e}");
         }
-        let (buf, len) = ProtoEvent::Capabilities {
-            enter_with_position: true,
-            source_key_repeat: cfg!(target_os = "macos"),
-        }
-        .into();
+        let (buf, len) = local_capabilities().into();
         if let Err(e) = conn.send(&buf[..len]).await {
             log::debug!("capabilities send to {addr} failed: {e}");
         }
@@ -283,11 +297,7 @@ async fn ping_pong(
     loop {
         // Retry negotiation even when a previous capability reply was lost.
         {
-            let (buf, len) = ProtoEvent::Capabilities {
-                enter_with_position: true,
-                source_key_repeat: cfg!(target_os = "macos"),
-            }
-            .into();
+            let (buf, len) = local_capabilities().into();
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: capability send error `{e}`, closing connection");
                 let _ = conn.close().await;
@@ -384,11 +394,13 @@ async fn receive_loop(
                     ProtoEvent::Capabilities {
                         enter_with_position,
                         source_key_repeat,
+                        macos_trackpad,
                     } => {
                         client_manager.set_peer_protocol_capabilities(
                             handle,
                             enter_with_position,
                             source_key_repeat,
+                            macos_trackpad,
                         );
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
@@ -415,13 +427,22 @@ async fn disconnect(
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
-    client_manager.set_peer_protocol_capabilities(handle, false, false);
+    client_manager.set_peer_protocol_capabilities(handle, false, false, false);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
 
 /// Only macOS capture currently produces source-timed repeats. Other backends
 /// and older receivers retain the existing press/release behavior.
+/// What this build can receive, advertised to every peer.
+pub(crate) fn local_capabilities() -> ProtoEvent {
+    ProtoEvent::Capabilities {
+        enter_with_position: true,
+        source_key_repeat: cfg!(target_os = "macos"),
+        macos_trackpad: cfg!(target_os = "macos"),
+    }
+}
+
 fn keyboard_event_for_peer(mut event: ProtoEvent, source_repeat: bool) -> Option<ProtoEvent> {
     if cfg!(target_os = "macos") {
         if let ProtoEvent::Input(input_event::Event::Keyboard(input_event::KeyboardEvent::Key {

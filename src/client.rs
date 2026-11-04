@@ -326,11 +326,20 @@ impl ClientManager {
         handle: ClientHandle,
         enter_with_position: bool,
         source_key_repeat: bool,
+        macos_trackpad: bool,
     ) {
         if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
             state.peer_supports_enter_with_position = enter_with_position;
             state.peer_supports_source_key_repeat = source_key_repeat;
+            state.peer_supports_macos_trackpad = macos_trackpad;
         }
+    }
+
+    pub(crate) fn supports_macos_trackpad(&self, handle: ClientHandle) -> bool {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .is_some_and(|(_, state)| state.peer_supports_macos_trackpad)
     }
 
     pub(crate) fn supports_enter_with_position(&self, handle: ClientHandle) -> bool {
@@ -395,13 +404,15 @@ mod tests {
         let clients = ClientManager::default();
         let handle = clients.add_client();
 
-        clients.set_peer_protocol_capabilities(handle, true, true);
+        clients.set_peer_protocol_capabilities(handle, true, true, true);
         assert!(clients.supports_enter_with_position(handle));
         assert!(clients.supports_source_key_repeat(handle));
+        assert!(clients.supports_macos_trackpad(handle));
 
-        clients.set_peer_protocol_capabilities(handle, false, false);
+        clients.set_peer_protocol_capabilities(handle, false, false, false);
         assert!(!clients.supports_enter_with_position(handle));
         assert!(!clients.supports_source_key_repeat(handle));
+        assert!(!clients.supports_macos_trackpad(handle));
     }
     #[test]
     fn addresses_preserve_configured_priority_then_append_unique_dns_results() {

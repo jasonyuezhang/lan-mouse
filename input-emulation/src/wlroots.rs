@@ -289,6 +289,9 @@ impl VirtualInput {
                         .modifiers(mods_depressed, mods_latched, mods_locked, group);
                 }
             },
+            // Native macOS events only reach Macs; InputEmulation converts
+            // any stray trackpad scroll to Axis first.
+            Event::Trackpad(_) => {}
         }
         Ok(())
     }

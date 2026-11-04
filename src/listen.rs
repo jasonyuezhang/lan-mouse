@@ -34,6 +34,8 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+// Large because of `Event::Trackpad`; see input_event::Event.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,

@@ -1573,6 +1573,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
+ "foreign-types",
  "futures",
  "futures-core",
  "input-event",

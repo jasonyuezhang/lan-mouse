@@ -728,6 +728,8 @@ thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+// Large because of `Event::Trackpad`; see input_event::Event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
 enum State {
     WaitingForAck { serial: u32, event: ProtoEvent },
