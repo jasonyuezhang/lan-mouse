@@ -41,6 +41,8 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
+// Large because of `Event::Trackpad`; see input_event::Event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active

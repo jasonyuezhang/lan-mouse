@@ -164,6 +164,15 @@ impl InputEmulation {
                 }
                 Ok(())
             }
+            #[cfg(not(target_os = "macos"))]
+            Event::Trackpad(t) => {
+                // Peers only send these when we advertise macos_trackpad, which
+                // non-macOS builds never do; degrade gracefully regardless.
+                for axis in t.scroll_fallback() {
+                    self.emulation.consume(Event::Pointer(axis), handle).await?;
+                }
+                Ok(())
+            }
             _ => self.emulation.consume(event, handle).await,
         }
     }

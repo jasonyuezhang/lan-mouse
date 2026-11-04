@@ -13,8 +13,9 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use foreign_types::ForeignType;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
-    scancode,
+    TrackpadEvent, scancode,
     screen::{Edge, EdgeSegments, Rect},
+    trackpad::{CG_DOCK_GESTURE, CG_SCROLL_WHEEL, TrackpadValue},
 };
 use keycode::{KeyMap, KeyMapping};
 use std::cell::Cell;
@@ -25,6 +26,8 @@ use std::time::{Duration, Instant};
 use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
+
+mod dock_swipe;
 
 // Must match Mac Mouse Fix's kMFLanMouseEventTag. A tag identifies the
 // virtual device; it does not authorize a connection or enable the engine.
@@ -111,6 +114,49 @@ impl MacOSEmulation {
     fn post_pointer_event(&self, event: &CGEvent) {
         event.set_flags(to_cgevent_flags(self.modifier_state.get()));
         post_remote_event(event);
+    }
+
+    /// Recreate a gesture / phased scroll captured on the other Mac. Location,
+    /// timestamp and source fields come from this Mac; only the payload fields
+    /// were forwarded (see `input_event::trackpad::is_forwarded_field`).
+    fn post_trackpad_event(&self, trackpad: &TrackpadEvent) {
+        /// `kCGEventType`-like private field used to set types CGEventType
+        /// cannot represent (gesture 29, dock gesture 30).
+        const EVENT_TYPE_FIELD: u32 = 55;
+        let event = if trackpad.cg_type() == CG_SCROLL_WHEEL {
+            CGEvent::new_scroll_event(
+                self.event_source.clone(),
+                ScrollEventUnit::PIXEL,
+                2,
+                0,
+                0,
+                0,
+            )
+        } else {
+            CGEvent::new(self.event_source.clone())
+                .inspect(|e| e.set_integer_value_field(EVENT_TYPE_FIELD, trackpad.cg_type().into()))
+        };
+        let Ok(event) = event else {
+            log::warn!("could not create {trackpad}");
+            return;
+        };
+        for (field, value) in trackpad.fields() {
+            match value {
+                TrackpadValue::Integer(v) => event.set_integer_value_field(field.into(), v),
+                TrackpadValue::Double(v) => event.set_double_value_field(field.into(), v),
+            }
+        }
+        if trackpad.cg_type() == CG_DOCK_GESTURE {
+            if !dock_swipe::attach_hid_event(&event, trackpad) {
+                log::debug!("dock swipe replay unavailable on this macOS");
+            }
+            // Posted after the HID taps: the Dock picks it up from here (as
+            // with Mac Mouse Fix), and this Mac's own capture tap never sees it.
+            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LAN_MOUSE_EVENT_TAG);
+            event.post(CGEventTapLocation::Session);
+            return;
+        }
+        self.post_pointer_event(&event);
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
@@ -565,6 +611,10 @@ impl Emulation for MacOSEmulation {
                 if !matches!(pointer_event, PointerEvent::Button { .. }) {
                     self.button_click_state = 0;
                 }
+            }
+            Event::Trackpad(trackpad) => {
+                self.post_trackpad_event(&trackpad);
+                self.button_click_state = 0;
             }
             Event::Keyboard(keyboard_event) => match keyboard_event {
                 KeyboardEvent::Key {

@@ -246,7 +246,7 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::Capabilities { .. } => {
-                                self.listener.reply(addr, ProtoEvent::Capabilities { enter_with_position: true, source_key_repeat: cfg!(target_os = "macos") }).await;
+                                self.listener.reply(addr, crate::connect::local_capabilities()).await;
                             }
                             _ => {}
                         }
@@ -311,6 +311,8 @@ pub(crate) struct EmulationProxy {
     task: JoinHandle<()>,
 }
 
+// Large because of `Event::Trackpad`; see input_event::Event.
+#[allow(clippy::large_enum_variant)]
 enum ProxyRequest {
     Input(Event, SocketAddr),
     WarpCursor(WarpPosition, f32, SocketAddr),

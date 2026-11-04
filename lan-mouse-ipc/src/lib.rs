@@ -194,6 +194,9 @@ pub struct ClientState {
     /// Runtime-only negotiation; this does not change the frontend IPC format.
     #[serde(skip)]
     pub peer_supports_source_key_repeat: bool,
+    /// Peer replays native macOS gestures / phased scrolling. Runtime-only.
+    #[serde(skip)]
+    pub peer_supports_macos_trackpad: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

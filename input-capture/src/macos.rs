@@ -47,6 +47,8 @@ use tokio::sync::{
     oneshot,
 };
 
+mod trackpad;
+
 static FILE_DRAG_CLOCK: OnceLock<Instant> = OnceLock::new();
 const LOCAL_FILE_DRAG_TAG: i64 = 0x4c4d4443414e434c; // LMDCANCL
 static FILE_DRAG_READY_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -580,24 +582,11 @@ fn get_events(
         }
         CGEventType::ScrollWheel => {
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
-                let v =
-                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-                let h =
-                    ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-                if v != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 0, // Vertical
-                        value: v as f64,
-                    })));
-                }
-                if h != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 1, // Horizontal
-                        value: h as f64,
-                    })));
-                }
+                // Keep scroll/momentum phases for a Mac peer; the sender
+                // downgrades this to pixel Axis events for anyone else.
+                result.push(CaptureEvent::Input(Event::Trackpad(
+                    trackpad::trackpad_event(input_event::trackpad::CG_SCROLL_WHEEL, ev),
+                )));
             } else {
                 // line based scrolling
                 const LINES_PER_STEP: i32 = 3;
@@ -848,6 +837,8 @@ fn event_tap_thread(
 ) {
     // Clone now: create_event_tap consumes notify_tx into its closure.
     let display_notify_tx = notify_tx.clone();
+    let gesture_state = client_state.clone();
+    let gesture_tx = event_tx.clone();
 
     let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
         Err(e) => {
@@ -860,6 +851,8 @@ fn event_tap_thread(
             tap
         }
     };
+    // Dropped after the run loop exits, before the context it points at.
+    let _gesture_tap = trackpad::GestureTap::install(gesture_state, gesture_tx);
 
     // Register a Quartz display-reconfiguration callback so the
     // capture state's bounds get refreshed when the user plugs in a

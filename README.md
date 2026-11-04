@@ -321,6 +321,11 @@ mappings, an input debugger, and guided pairing/removal for two Macs.
 The menu bar also controls the power of a USB-connected Logitech Litra Glow on
 this Mac, independently of mouse and keyboard sharing.
 
+Between two Macs, the trackpad works on the other Mac like a local one:
+momentum scrolling and rubber-banding, back/forward swipes, pinch, rotate,
+smart zoom and Spaces/Mission Control swipes. Both Macs need the updated
+daemon; this relies on undocumented macOS event fields (see [DOC.md](DOC.md)).
+
 Between Macs, each crossing preserves the current relative position along the
 shared edge, including when returning to the first Mac. Capture releases its
 cursor lock and restores visibility before applying the incoming position.

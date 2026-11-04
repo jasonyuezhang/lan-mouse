@@ -147,6 +147,9 @@ impl Emulation for DesktopPortalEmulation {
                     }
                 }
             }
+            // Native macOS events only reach Macs; InputEmulation converts
+            // any stray trackpad scroll to Axis first.
+            input_event::Event::Trackpad(_) => {}
         }
         Ok(())
     }

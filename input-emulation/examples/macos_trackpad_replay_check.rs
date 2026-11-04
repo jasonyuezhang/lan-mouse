@@ -1,0 +1,93 @@
+//! Posts a zero-magnification pinch and a zero-delta phased scroll through the
+//! macOS emulation backend, so a session-level event tap can confirm macOS
+//! accepts recreated gesture events (type 29 with subtype 8 and phase intact).
+//! Nothing zooms or scrolls; the Dock swipe at the end visibly switches one
+//! Space over and back.
+//!
+//!   cargo run -p input-emulation --example macos_trackpad_replay_check
+//!
+//! Needs Accessibility permission for the terminal. Watch with any listen-only
+//! session tap on gesture types 29 / 30 and scroll type 22. Pause sharing first:
+//! while this Mac is controlling the other one, the daemon's HID tap captures
+//! (and forwards) synthetic scroll events before a session tap can see them.
+
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(tokio::task::LocalSet::new().run_until(run()));
+}
+
+#[cfg(target_os = "macos")]
+async fn run() {
+    use input_emulation::{Backend, InputEmulation};
+    use input_event::{
+        Event, TrackpadEvent,
+        trackpad::{CG_DOCK_GESTURE, CG_GESTURE, CG_SCROLL_WHEEL, TrackpadValue::*},
+    };
+    use std::time::Duration;
+
+    let mut emulation = InputEmulation::new(Some(Backend::MacOs))
+        .await
+        .expect("macOS emulation (Accessibility permission?)");
+    emulation.create(0).await;
+
+    // IOHIDEventPhaseBits: began 1, changed 2, ended 4.
+    for phase in [1, 2, 2, 4] {
+        let mut pinch = TrackpadEvent::new(CG_GESTURE);
+        pinch.push(110, Integer(8)).unwrap(); // kIOHIDEventTypeZoom
+        pinch.push(132, Integer(phase)).unwrap();
+        pinch.push(113, Double(0.0)).unwrap();
+        // every gesture frame is followed by a bare type-29 terminator
+        let terminator = TrackpadEvent::new(CG_GESTURE);
+        for e in [pinch, terminator] {
+            emulation.consume(Event::Trackpad(e), 0).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    println!("posted pinch: 4 frames (subtype 8, phases 1,2,2,4)");
+
+    // kCGScrollWheelEventScrollPhase: began 1, changed 2, ended 4.
+    for phase in [1, 2, 4] {
+        let mut scroll = TrackpadEvent::new(CG_SCROLL_WHEEL);
+        scroll.push(88, Integer(1)).unwrap(); // continuous
+        scroll.push(99, Integer(phase)).unwrap();
+        emulation.consume(Event::Trackpad(scroll), 0).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    println!("posted scroll: 3 frames (phases 1,2,4)");
+
+    // Horizontal Dock swipe one Space over and back (fields as captured from a
+    // real three-finger swipe). This one is visible: the Space changes twice.
+    for direction in [-1.0, 1.0] {
+        for step in 1..=20 {
+            let phase = match step {
+                1 => 1,
+                20 => 4,
+                _ => 2,
+            };
+            let mut swipe = TrackpadEvent::new(CG_DOCK_GESTURE);
+            swipe.push(110, Integer(23)).unwrap(); // kIOHIDEventTypeDockSwipe
+            swipe.push(123, Integer(1)).unwrap(); // horizontal
+            swipe
+                .push(124, Double(direction * step as f64 / 20.0))
+                .unwrap();
+            swipe.push(132, Integer(phase)).unwrap();
+            swipe.push(138, Integer(3)).unwrap(); // dock primary
+            if phase == 4 {
+                swipe.push(129, Double(direction * 10.0)).unwrap();
+                swipe.push(130, Double(direction * 10.0)).unwrap();
+            }
+            emulation.consume(Event::Trackpad(swipe), 0).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(8)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    println!("posted dock swipe: one Space over and back");
+    emulation.terminate().await;
+}
