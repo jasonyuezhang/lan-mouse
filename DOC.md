@@ -86,6 +86,13 @@ private `SLEventSetIOHIDEvent`, then posts it at the session tap. Both private
 symbols are looked up at runtime; if they go away, swipes stay inert instead of
 breaking the daemon.
 
+A swipe whose end frame never arrives (dropped from a full capture queue, lost
+over UDP, or cut off by capture switching mid-gesture) would leave the Dock
+mid-transition and the receiving desktop unresponsive. The receiver therefore
+ends any swipe that gets no frame for one second, and when the peer
+disconnects. Each swipe logs `dock swipe began` / `dock swipe ended` at info
+level, and a rescued one logs a warning.
+
 Both peers must advertise the `macos_trackpad` capability (bit 2 of
 `Capabilities`). Linux, Windows and older peers keep receiving plain pixel
 scroll and never see gestures, so mixed setups are unaffected. Run

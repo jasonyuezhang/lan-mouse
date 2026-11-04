@@ -61,6 +61,8 @@ pub(crate) struct MacOSEmulation {
     /// the user's key repeat settings on this machine
     repeat_delay: Duration,
     repeat_interval: Duration,
+    /// replays Dock swipes and ends any the peer leaves open
+    dock_swipe: dock_swipe::DockSwipeReplay,
 }
 
 /// Maps an evdev button code to the CGEventType used for drag events.
@@ -104,6 +106,7 @@ impl MacOSEmulation {
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             repeat_delay,
             repeat_interval,
+            dock_swipe: Default::default(),
         })
     }
 
@@ -119,7 +122,11 @@ impl MacOSEmulation {
     /// Recreate a gesture / phased scroll captured on the other Mac. Location,
     /// timestamp and source fields come from this Mac; only the payload fields
     /// were forwarded (see `input_event::trackpad::is_forwarded_field`).
-    fn post_trackpad_event(&self, trackpad: &TrackpadEvent) {
+    fn post_trackpad_event(&mut self, trackpad: &TrackpadEvent) {
+        if trackpad.cg_type() == CG_DOCK_GESTURE {
+            self.dock_swipe.post(&self.event_source, trackpad);
+            return;
+        }
         /// `kCGEventType`-like private field used to set types CGEventType
         /// cannot represent (gesture 29, dock gesture 30).
         const EVENT_TYPE_FIELD: u32 = 55;
@@ -145,16 +152,6 @@ impl MacOSEmulation {
                 TrackpadValue::Integer(v) => event.set_integer_value_field(field.into(), v),
                 TrackpadValue::Double(v) => event.set_double_value_field(field.into(), v),
             }
-        }
-        if trackpad.cg_type() == CG_DOCK_GESTURE {
-            if !dock_swipe::attach_hid_event(&event, trackpad) {
-                log::debug!("dock swipe replay unavailable on this macOS");
-            }
-            // Posted after the HID taps: the Dock picks it up from here (as
-            // with Mac Mouse Fix), and this Mac's own capture tap never sees it.
-            event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, LAN_MOUSE_EVENT_TAG);
-            event.post(CGEventTapLocation::Session);
-            return;
         }
         self.post_pointer_event(&event);
     }
@@ -686,6 +683,7 @@ impl Emulation for MacOSEmulation {
     async fn create(&mut self, _handle: EmulationHandle) {}
 
     async fn destroy(&mut self, handle: EmulationHandle) {
+        self.dock_swipe.finish(&self.event_source);
         if self.file_drag_owner == Some(handle) {
             if let Err(error) = self
                 .consume(
@@ -704,6 +702,7 @@ impl Emulation for MacOSEmulation {
     }
 
     async fn terminate(&mut self) {
+        self.dock_swipe.finish(&self.event_source);
         self.cancel_repeat_task().await;
     }
 
